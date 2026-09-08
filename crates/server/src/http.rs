@@ -3965,6 +3965,77 @@ fn normalized_wda_axis(value: f64, size: f64) -> anyhow::Result<f64> {
     Ok((value * size).clamp(1.0, size - 1.0))
 }
 
+/// How far from a screen edge a *scroll* gesture has to stay. iOS claims the
+/// edges for its own gestures: a touch that starts in the left band becomes the
+/// interactive back-swipe, and the bottom band is the home indicator. Reported
+/// on hardware in #78 — a page scroll anchored at `x=0.06` (26pt on a 440pt-wide
+/// phone) fired the back gesture three times and aborted a half-finished bank
+/// form. 26pt is the only measured data point, so the guard is a full 44pt touch
+/// unit rather than the ~20pt the edge recognizer nominally reserves.
+///
+/// Only scrolls are guarded. `tap`/`longpress` must still reach edge controls,
+/// and `swipe`/`drag`/`back` are gestures the caller asked for by name — for a
+/// scroll the anchor is incidental, the caller wants the content to move.
+const SCROLL_EDGE_GUARD_PT: f64 = 44.0;
+
+/// The band a scroll gesture may touch along one axis: `[guard, size - guard]`.
+/// The guard shrinks on axes too small to hold one so the band is never empty.
+fn scroll_edge_band(size: f64) -> (f64, f64) {
+    let guard = SCROLL_EDGE_GUARD_PT.min(size / 4.0);
+    (guard, size - guard)
+}
+
+/// Keep a single scroll coordinate out of the edge zone.
+fn guard_scroll_coord(value: f64, size: f64) -> f64 {
+    let (lo, hi) = scroll_edge_band(size);
+    if hi <= lo {
+        value
+    } else {
+        value.clamp(lo, hi)
+    }
+}
+
+/// Move a gesture segment out of the edge zone *without changing how far it
+/// travels*: translate the whole span first, and clamp (shortening the swipe)
+/// only when the requested travel is wider than the band itself. `swipe_travel`
+/// caps travel at 75% of the axis and the band is `axis - 88pt`, so on real
+/// phone geometry the translation always fits and the scroll distance the
+/// caller asked for survives.
+fn guard_scroll_span(a: f64, b: f64, size: f64) -> (f64, f64) {
+    let (lo, hi) = scroll_edge_band(size);
+    if hi <= lo {
+        return (a, b);
+    }
+    let (min, max) = if a <= b { (a, b) } else { (b, a) };
+    let shift = if min < lo {
+        lo - min
+    } else if max > hi {
+        hi - max
+    } else {
+        0.0
+    };
+    ((a + shift).clamp(lo, hi), (b + shift).clamp(lo, hi))
+}
+
+/// Endpoints of a coordinate scroll: anchor at `nx`/`ny`, finger travelling
+/// opposite to the content reveal, both ends held out of the system edge zones.
+fn coordinate_swipe_endpoints(
+    nx: f64,
+    ny: f64,
+    dx: f64,
+    dy: f64,
+    sw: f64,
+    sh: f64,
+) -> anyhow::Result<(f64, f64, f64, f64)> {
+    let cx = normalized_wda_axis(nx, sw)?;
+    let cy = normalized_wda_axis(ny, sh)?;
+    let tx = swipe_travel(dx, sw);
+    let ty = swipe_travel(dy, sh);
+    let (x1, x2) = guard_scroll_span(cx + tx / 2.0, cx - tx / 2.0, sw);
+    let (y1, y2) = guard_scroll_span(cy + ty / 2.0, cy - ty / 2.0, sh);
+    Ok((x1, y1, x2, y2))
+}
+
 pub(crate) async fn wda_swipe(
     w: &mut crate::wda::WdaClient,
     nx: f64,
@@ -3973,14 +4044,7 @@ pub(crate) async fn wda_swipe(
     dy: f64,
 ) -> anyhow::Result<()> {
     let (sw, sh) = w.window_size().await?;
-    let cx = normalized_wda_axis(nx, sw)?;
-    let cy = normalized_wda_axis(ny, sh)?;
-    let tx = swipe_travel(dx, sw);
-    let ty = swipe_travel(dy, sh);
-    let x1 = (cx + tx / 2.0).clamp(1.0, sw - 1.0);
-    let x2 = (cx - tx / 2.0).clamp(1.0, sw - 1.0);
-    let y1 = (cy + ty / 2.0).clamp(1.0, sh - 1.0);
-    let y2 = (cy - ty / 2.0).clamp(1.0, sh - 1.0);
+    let (x1, y1, x2, y2) = coordinate_swipe_endpoints(nx, ny, dx, dy, sw, sh)?;
     let dist = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
     let dur = (dist * 1.2).clamp(120.0, 600.0) as u64;
     w.swipe(x1, y1, x2, y2, dur).await
@@ -5247,8 +5311,22 @@ fn element_swipe_endpoints(
     }
     let clamp_x = |v: f64| v.clamp(left + 2.0, (right - 2.0).max(left + 2.0));
     let clamp_y = |v: f64| v.clamp(top + 2.0, (bottom - 2.0).max(top + 2.0));
-    let rx = clamp_x(row[0] + row[2] / 2.0);
-    let ry = clamp_y(row[1] + row[3] / 2.0);
+    let mut rx = clamp_x(row[0] + row[2] / 2.0);
+    let mut ry = clamp_y(row[1] + row[3] / 2.0);
+    // Same edge hazard as a coordinate scroll (#78): a row pinned against the
+    // left edge puts the touch column inside the back-gesture zone, and the
+    // page never scrolls. Nudge the axis the gesture does NOT travel along —
+    // the travel axis is what the container was measured for — and let the
+    // container clamp win, so the touch never leaves the element we were asked
+    // to scroll inside.
+    if let Some((sw, sh)) = screen {
+        if dx == 0.0 {
+            rx = clamp_x(guard_scroll_coord(rx, sw));
+        }
+        if dy == 0.0 {
+            ry = clamp_y(guard_scroll_coord(ry, sh));
+        }
+    }
     let tx = swipe_travel(dx, right - left);
     let ty = swipe_travel(dy, bottom - top);
     // Start on the row; end `travel` away, opposite to the content direction.
@@ -10749,6 +10827,52 @@ mod tests {
         // No screen size known: still starts on the row.
         let (_, y_ns, _, _) = element_swipe_endpoints(row, popup_list, None, 0.0, 300.0);
         assert!((y_ns - 263.0).abs() < 1.0);
+    }
+
+    // Issue #78: a page scroll anchored at x=0.06 (26pt on this phone) was
+    // claimed by the iOS interactive back-swipe instead of scrolling — three
+    // times, on a bank form that then had to be re-entered from scratch.
+    #[test]
+    fn a_coordinate_scroll_keeps_its_touch_column_off_the_edge_gesture_zone() {
+        let (sw, sh) = (440.0, 956.0);
+        // The reported anchor.
+        let (x1, _, x2, _) = coordinate_swipe_endpoints(0.06, 0.5, 0.0, 600.0, sw, sh).unwrap();
+        assert!(x1 >= 44.0 && x2 >= 44.0, "off the back-gesture zone: {x1},{x2}");
+        // Mirrored on the trailing edge.
+        let (x1, _, x2, _) = coordinate_swipe_endpoints(0.98, 0.5, 0.0, 600.0, sw, sh).unwrap();
+        assert!(x1 <= sw - 44.0 && x2 <= sw - 44.0, "off the trailing edge: {x1},{x2}");
+        // A mid-screen scroll is left exactly as it was.
+        let (x1, y1, x2, y2) = coordinate_swipe_endpoints(0.5, 0.5, 0.0, 600.0, sw, sh).unwrap();
+        assert!((x1 - 220.0).abs() < 1.0 && (x2 - 220.0).abs() < 1.0, "anchor kept: {x1},{x2}");
+        assert!(((y1 - y2).abs() - 717.0).abs() < 1.0, "travel kept: {y1},{y2}");
+    }
+
+    // Same math, edge not reported on hardware: a scroll anchored low used to
+    // clamp its start onto the last pixel row — the home indicator — and lose
+    // travel doing it. The span is translated instead.
+    #[test]
+    fn a_low_scroll_is_moved_up_instead_of_starting_on_the_home_indicator() {
+        let (sw, sh) = (440.0, 956.0);
+        let (_, y1, _, y2) = coordinate_swipe_endpoints(0.5, 0.8, 0.0, 600.0, sw, sh).unwrap();
+        assert!(y1 <= sh - 44.0, "off the home indicator: {y1}");
+        assert!(y2 >= 44.0, "off the status bar: {y2}");
+        assert!(((y1 - y2).abs() - 717.0).abs() < 1.0, "travel kept: {y1},{y2}");
+    }
+
+    // The element path has the same hazard (a row pinned to the left edge),
+    // but the container it was asked to scroll inside still wins.
+    #[test]
+    fn an_element_scroll_leaves_the_edge_only_as_far_as_its_container_allows() {
+        let row = [4.0, 400.0, 26.0, 30.0];
+        let screen = Some((440.0, 956.0));
+        let full_width = [0.0, 92.0, 440.0, 800.0];
+        let (x1, _, x2, _) = element_swipe_endpoints(row, full_width, screen, 0.0, 300.0);
+        assert!(x1 >= 44.0 && x2 >= 44.0, "moved inboard: {x1},{x2}");
+        // A container that itself lives in the edge zone keeps the gesture:
+        // leaving it would scroll something the caller did not name.
+        let narrow = [0.0, 92.0, 30.0, 800.0];
+        let (x1, _, _, _) = element_swipe_endpoints(row, narrow, screen, 0.0, 300.0);
+        assert!(x1 <= 28.0, "stays inside its container: {x1}");
     }
 
     #[test]
