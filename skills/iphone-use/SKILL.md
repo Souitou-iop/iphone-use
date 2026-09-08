@@ -406,7 +406,14 @@ documented or unit-tested action is not automatically a current-device proof:
   the ACK alone for state changes.
 - **Scroll**: positive `dy` reveals content farther down; negative `dy` reveals
   content above. Positive `dx` reveals content to the right. A scroll is an
-  atomic WDA swipe, not a stream of wheel events.
+  atomic WDA swipe, not a stream of wheel events. A coordinate scroll holds its
+  touch point 44pt clear of the screen edges (the requested distance is
+  unchanged): a scroll anchored at `x=0.06` was being taken over by the iOS
+  back-swipe instead of scrolling the page. An element scroll gets the same
+  nudge only where its container leaves room — inside a container that itself
+  hugs the edge the gesture is unchanged, so an edge-hugging element can still
+  lose the swipe to the system. A gesture you actually want to start at an edge
+  belongs in `swipe`/`drag`, which are never adjusted.
 - **Text input** — focus and verify a field first, then `{"type":"text"}`.
   Direct/WDA sends Unicode on-device, so ASCII and CJK land without touching
   the Mac clipboard or keyboard.
