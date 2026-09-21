@@ -3118,7 +3118,22 @@ else
     fi
 fi
 TRIES=0
-until _devicectl_t 10 device info details --device "$WDA_UDID" | grep -q "ddiServicesAvailable: true"; do
+# Readiness comes from devicectl's JSON output: current Xcode dropped the
+# `ddiServicesAvailable` line from the human-readable text, so grepping the
+# text could never pass (#81). The text form stays as a fallback for older
+# Xcode builds whose -j output may lack the key.
+_ddi_ready() {
+    local j; j="$(mktemp)"
+    local text; text="$(_devicectl_t 10 device info details --device "$WDA_UDID" -j "$j")"
+    local r=1
+    if grep -Eq '"ddiServicesAvailable" *: *true' "$j" 2>/dev/null \
+        || printf '%s\n' "$text" | grep -q "ddiServicesAvailable: true"; then
+        r=0
+    fi
+    rm -f "$j"
+    return $r
+}
+until _ddi_ready; do
     TRIES=$((TRIES+1))
     # Keep per-step diagnostics fresh too; the independent 15s heartbeat
     # covers a devicectl call (or another blocking stage) that stalls.
