@@ -32,7 +32,7 @@ done
 for n in core server iphone-use-mcp; do
   sed -i.bak "/^name = \"$n\"\$/{n;s/^version = \".*\"/version = \"$V\"/;}" Cargo.lock && rm Cargo.lock.bak
 done
-cargo metadata --locked --offline --format-version 1 >/dev/null || die "Cargo.lock out of sync"
+cargo metadata --locked -q --format-version 1 >/dev/null || die "Cargo.lock out of sync"
 
 # The release gate's helper tests (release-binaries.yml "Validate installer and release coherence").
 t() { "$@" >/dev/null 2>&1 || die "$* failed"; }
@@ -55,8 +55,7 @@ if [ "$DRY" = 1 ]; then
   exit 0
 fi
 
-git add $CRATES Cargo.lock
-git commit -qm "chore(release): v$V"
+git diff --quiet || git commit -qm "chore(release): v$V" -- $CRATES Cargo.lock
 trap - EXIT
 git tag "v$V"
 git push -q origin main "v$V"
