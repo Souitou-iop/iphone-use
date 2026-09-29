@@ -559,6 +559,8 @@ PHONE_REMOTE_WDA_MJPEG_URL=http://127.0.0.1:9100 \
 PHONE_REMOTE_HOST=0.0.0.0 PHONE_REMOTE_PASSWORD=secret ./target/release/iphone-use serve
 ```
 
+Release: `scripts/release.sh 0.6.8` bumps the crates, runs the release gate's tests, pushes the tag, waits for the release build and syncs the plugin marketplace (`--dry-run` to preview).
+
 | Path | What lives there |
 |---|---|
 | `crates/server` | daemon: WDA control, MJPEG proxy, browser `/control`, agent API, legacy mirror signaling |

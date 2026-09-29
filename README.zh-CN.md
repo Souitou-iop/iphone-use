@@ -351,6 +351,8 @@ PHONE_REMOTE_WDA_MJPEG_URL=http://127.0.0.1:9100 \
 PHONE_REMOTE_HOST=0.0.0.0 PHONE_REMOTE_PASSWORD=secret ./target/release/iphone-use serve
 ```
 
+发版：`scripts/release.sh 0.6.8` 升 crate 版本、跑发版门禁测试、推 tag、等 release 构建完成后同步插件市场（`--dry-run` 只预演）。
+
 | 路径 | 内容 |
 |---|---|
 | `crates/server` | daemon：WDA 控制、MJPEG 代理、浏览器 `/control`、agent API、旧镜像信令 |
