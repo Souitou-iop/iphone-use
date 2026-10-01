@@ -1,6 +1,6 @@
 [package]
 name = "server"
-version = "0.7.4"
+version = "0.7.5"
 edition = "2021"
 
 # The daemon binary. Lib stays for unit-testable glue (http/signaling/webrtc
