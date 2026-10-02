@@ -8,6 +8,20 @@ struct IPhoneUseRemoteApp: App {
         WindowGroup {
             RootView(model: model)
                 .preferredColorScheme(.dark)
+                // The landing page a scanned QR opens hands off here.
+                .onOpenURL { model.handle(url: $0) }
+                .alert(
+                    "连接到这台 Mac？",
+                    isPresented: Binding(
+                        get: { model.pendingLink != nil },
+                        set: { if !$0 { model.pendingLink = nil } }),
+                    presenting: model.pendingLink
+                ) { _ in
+                    Button("连接") { model.confirmPendingLink() }
+                    Button("取消", role: .cancel) { model.pendingLink = nil }
+                } message: { link in
+                    Text("\(link.base.host() ?? link.base.absoluteString)\n只在你刚刚扫了自己 Mac 上的二维码时才点「连接」。")
+                }
         }
     }
 }
@@ -34,22 +48,25 @@ struct RootView: View {
 struct ConnectView: View {
     @Bindable var model: RemoteModel
     @State private var password = ""
+    @State private var scanning = false
     @FocusState private var focused: Bool
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("http://192.168.1.11:44321", text: $model.address)
-                        .keyboardType(.URL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .focused($focused)
-                    SecureField("控制密码", text: $password)
-                } header: {
-                    Text("Mac 上的 iphone-use 服务")
+                    Button {
+                        scanning = true
+                    } label: {
+                        Label("扫码连接", systemImage: "qrcode.viewfinder")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity, minHeight: 44)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
                 } footer: {
-                    Text("地址和密码在 Mac 上运行安装程序时会打印出来。手机和 Mac 需要在同一个网络里，或者通过 VPN 连通。")
+                    Text("在 Mac 上打开 iphone-use 页面，点工具栏的「扫码」，再用这里扫一下。用 iPhone 自带相机扫也可以。")
                 }
                 if case let .failed(why) = model.phase {
                     Section {
@@ -58,16 +75,28 @@ struct ConnectView: View {
                     }
                 }
                 Section {
+                    TextField("http://192.168.1.11:44321", text: $model.address)
+                        .keyboardType(.URL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .focused($focused)
+                    SecureField("控制密码", text: $password)
+                } header: {
+                    Text("或者手动输入")
+                } footer: {
+                    Text("地址和密码在 Mac 上运行安装程序时会打印出来。手机和 Mac 需要在同一个网络里，或者通过 VPN 连通。")
+                }
+                Section {
                     Button {
                         Task { await model.connect(password: password) }
                     } label: {
-                        Text("连接").frame(maxWidth: .infinity)
+                        Text("用密码连接").frame(maxWidth: .infinity)
                     }
                     .disabled(model.address.isEmpty || password.isEmpty)
                 }
             }
             .navigationTitle("iPhone Use")
-            .onAppear { focused = model.address.isEmpty }
+            .fullScreenCover(isPresented: $scanning) { ScanSheet(model: model) }
         }
     }
 }
