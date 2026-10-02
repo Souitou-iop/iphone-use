@@ -1,15 +1,13 @@
-//! L2 element-tree control via WebDriverAgent (WDA).
+//! Device control via WebDriverAgent (WDA).
 //!
-//! This is the "L2" layer (see the roadmap / `docs/wda-setup.html`): instead of
-//! the L3 pixel path (vision → coords → a synthetic click on the host Mac's one
-//! shared cursor), we drive iOS's own accessibility tree. WDA runs *on the
-//! phone* (Appium's runner, default `http://<phone>:8100`) and synthesizes the
-//! events itself — so there is no cursor contention, no coordinate drift, and
-//! text goes in as a real string (bypassing the keycode / Pinyin-IME caveat).
+//! WDA runs *on the phone* (Appium's runner, default `http://<phone>:8100`),
+//! drives iOS's own accessibility tree, and synthesizes the events itself — so
+//! nothing touches the Mac's cursor, coordinates do not drift, and text goes in
+//! as a real string (no keycode / Pinyin-IME caveat).
 //!
-//! This module is the daemon-side HTTP client for WDA's (W3C-ish) API. Direct
-//! mode routes browser and agent input here and fails closed when the device
-//! service is unavailable; the legacy Mac-side L3 path is a separate backend.
+//! This module is the daemon-side HTTP client for WDA's (W3C-ish) API. Browser
+//! and agent input route here and fail closed when the device service is
+//! unavailable.
 //! Request shapes follow Appium WebDriverAgent, and response parsers reject
 //! both HTTP failures and W3C error envelopes.
 
@@ -36,6 +34,11 @@ pub struct WdaClient {
     base: String, // e.g. "http://192.168.0.190:8100"
     http: reqwest::Client,
     session: Option<String>,
+    /// Last `GET /window/size` answer and when it was read. Every coordinate
+    /// gesture needs the size to map normalized points, and the read costs
+    /// ~180 ms on a real phone — more than a third of a tap. A short TTL keeps
+    /// a burst of gestures on one read and still notices a rotation.
+    window: Option<((f64, f64), std::time::Instant)>,
     /// How long `probe_health` waits for session/lock/apps-list before
     /// settling on "up, not actionable". Tests shrink it.
     actionability_budget: Duration,
@@ -54,6 +57,7 @@ impl WdaClient {
             base: base_url.into().trim_end_matches('/').to_string(),
             http,
             session: None,
+            window: None,
             actionability_budget: ACTIONABILITY_PROBE_BUDGET,
         })
     }
@@ -207,8 +211,16 @@ impl WdaClient {
     /// under `value.sessionId` across versions — we accept either).
     pub async fn ensure_session(&mut self) -> Result<&str> {
         if self.session.is_none() {
+            // XCUITest waits for the app to go idle and for animations to
+            // cool off around every action — up to 10 s in an app that never
+            // stops animating (a carousel, a video). The daemon observes the
+            // screen itself (MJPEG, its own settle reads), so the wait buys
+            // nothing and turns a 0.3 s tap into seconds.
             let body = serde_json::json!({
-                "capabilities": { "alwaysMatch": {}, "firstMatch": [{}] }
+                "capabilities": {
+                    "alwaysMatch": { "shouldWaitForQuiescence": false },
+                    "firstMatch": [{}]
+                }
             });
             let text = self
                 .http
@@ -223,6 +235,33 @@ impl WdaClient {
                 .await
                 .context("POST /session body")?;
             self.session = Some(parse_session_id(&text)?);
+            self.window = None;
+            {
+                let sid = self.session.as_deref().unwrap().to_string();
+                let result = self
+                    .http
+                    .post(format!("{}/session/{}/appium/settings", self.base, sid))
+                    .json(&serde_json::json!({ "settings": {
+                        "waitForIdleTimeout": 0,
+                        "animationCoolOffTimeout": 0,
+                    }}))
+                    // A runner slow to answer must not hold session setup.
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await;
+                // Best effort: an older runner without these settings still
+                // works, just slower.
+                match result {
+                    Ok(response) => {
+                        if let Err(error) =
+                            ensure_wda_success(response, "POST /appium/settings (idle)").await
+                        {
+                            tracing::debug!("could not disable WDA idle waits: {error:#}");
+                        }
+                    }
+                    Err(error) => tracing::debug!("could not disable WDA idle waits: {error:#}"),
+                }
+            }
             // Opt-in bounded-snapshot settings (issue #44): apps with an
             // enormous accessibility tree (hardware-reported with KakaoTalk)
             // can make WDA's hierarchy snapshot run so long that testmanagerd
@@ -382,7 +421,7 @@ impl WdaClient {
 
     /// Type a literal string into an element (`POST .../element/:id/value`).
     /// WDA sends it through the on-device text input, so **CJK goes in directly**
-    /// — this is the whole reason L2 beats the L3 keycode path for text.
+    /// — no keycode mapping, no input-method interference.
     pub async fn type_into(&mut self, element_id: &str, text: &str) -> Result<()> {
         let sid = self.ensure_session().await?.to_string();
         let response = self
@@ -634,9 +673,7 @@ impl WdaClient {
     /// The older `/wda/tap/0` helper 404s on current WDA builds (verified on
     /// 14.1.1 / iOS 27): the route was element-scoped (`/wda/tap/<element>`) and
     /// element `0` no longer resolves. `/actions` is the W3C-standard path and is
-    /// present across builds, so a coordinate tap never silently falls through to
-    /// the Mirroring (L3) injector — which drops the event when the phone is in
-    /// hand and the Mirroring window isn't frontmost.
+    /// present across builds.
     pub async fn tap_point(&mut self, x: f64, y: f64) -> Result<()> {
         let sid = self.ensure_session().await?.to_string();
         let response = self
@@ -733,10 +770,7 @@ impl WdaClient {
 
     /// Swipe/scroll gesture via the W3C Actions API — a single touch that
     /// presses at `(x1,y1)`, drags to `(x2,y2)` over `duration_ms`, and lifts.
-    /// Synthesized on the phone like [`Self::tap_point`], so it works in agent
-    /// mode regardless of whether the Mirroring window is frontmost (issue #27:
-    /// `scroll` used to fall back to the L3/CGEvent path, which the OS drops
-    /// when a human holds the Mac's foreground). Coords are WDA points
+    /// Synthesized on the phone like [`Self::tap_point`]. Coords are WDA points
     /// (top-left origin), NOT normalized — convert via [`Self::window_size`].
     ///
     /// A short press-pause before the move makes XCUITest register a drag
@@ -780,9 +814,7 @@ impl WdaClient {
     }
 
     /// Press the Home button on-device (`POST /wda/pressButton` `{name:home}`).
-    /// Works in agent mode regardless of the Mirroring window — the `shortcut`
-    /// path routes through L3 and needs the mirror frontmost, so this is the
-    /// reliable "go home".
+    /// The reliable "go home".
     pub async fn press_home(&mut self) -> Result<()> {
         let sid = self.ensure_session().await?.to_string();
         let response = self
@@ -912,6 +944,18 @@ impl WdaClient {
     /// Window (screen) size in WDA points — needed to map our normalized
     /// `[0,1]` agent coordinates onto [`Self::tap_point`]'s absolute points.
     pub async fn window_size(&mut self) -> Result<(f64, f64)> {
+        const WINDOW_SIZE_TTL: Duration = Duration::from_secs(3);
+        if let Some((size, at)) = self.window {
+            if at.elapsed() < WINDOW_SIZE_TTL {
+                return Ok(size);
+            }
+        }
+        let size = self.read_window_size().await?;
+        self.window = Some((size, std::time::Instant::now()));
+        Ok(size)
+    }
+
+    async fn read_window_size(&mut self) -> Result<(f64, f64)> {
         let sid = self.ensure_session().await?.to_string();
         let response = self
             .http
@@ -1106,8 +1150,7 @@ impl WdaClient {
     }
 
     /// Current phone screen as PNG bytes (`GET /screenshot`, base64 in the
-    /// envelope). Works with no Mirroring window at all — the capture happens
-    /// on the phone — so it's the L2 fallback when the L3 capture is gone.
+    /// envelope). The capture happens on the phone.
     pub async fn screenshot_png(&mut self) -> Result<Vec<u8>> {
         // Session-less endpoint; no ensure_session needed.
         let response = self
@@ -1285,6 +1328,7 @@ impl WdaClient {
     /// stale); the next call re-creates one via [`Self::ensure_session`].
     pub fn invalidate_session(&mut self) {
         self.session = None;
+        self.window = None;
     }
 
     /// `POST /session/:id/wda/lock` — lock the phone's screen.
@@ -1882,9 +1926,12 @@ mod tests {
     fn force_touch_request_body_is_never_empty() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let recorder = std::sync::Arc::clone(&seen);
-        let (base, task) = mock_wda(2, move |request| {
+        let (base, task) = mock_wda(3, move |request| {
             if request.starts_with("POST /session ") {
                 return r#"{"sessionId":"S-1","value":{}}"#.to_string();
+            }
+            if request.contains("/appium/settings") {
+                return r#"{"value":null}"#.to_string();
             }
             if request.contains("forceTouch") {
                 let body = request.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
@@ -1925,9 +1972,12 @@ mod tests {
     // router can map to "not sent", not as an opaque transport failure.
     #[test]
     fn force_press_refusal_is_a_typed_error() {
-        let (base, task) = mock_wda(2, |request| {
+        let (base, task) = mock_wda(3, |request| {
             if request.starts_with("POST /session ") {
                 return r#"{"sessionId":"S-1","value":{}}"#.to_string();
+            }
+            if request.contains("/appium/settings") {
+                return r#"{"value":null}"#.to_string();
             }
             http_400(FORCE_PRESS_UNSUPPORTED_BODY)
         });
@@ -1944,9 +1994,12 @@ mod tests {
     // a missing element to the router's `404 Not Found` check.
     #[test]
     fn other_gesture_client_errors_keep_status_and_body() {
-        let (base, task) = mock_wda(2, |request| {
+        let (base, task) = mock_wda(3, |request| {
             if request.starts_with("POST /session ") {
                 return r#"{"sessionId":"S-1","value":{}}"#.to_string();
+            }
+            if request.contains("/appium/settings") {
+                return r#"{"value":null}"#.to_string();
             }
             let body = r#"{"value":{"error":"no such element","message":"gone"}}"#;
             format!(

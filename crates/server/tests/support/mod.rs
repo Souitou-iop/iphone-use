@@ -16,7 +16,6 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
-use server::core_crate::encode::{EncodedFrame, VideoPipeline};
 use server::http::AppState;
 
 /// Run a future to completion on a fresh current-thread runtime.
@@ -28,20 +27,7 @@ pub fn block<F: std::future::Future>(f: F) -> F::Output {
         .block_on(f)
 }
 
-/// A no-op pipeline: never emits frames; `request_keyframe` is a no-op.
-struct NullPipeline {
-    tx: tokio::sync::broadcast::Sender<EncodedFrame>,
-}
-
-impl VideoPipeline for NullPipeline {
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<EncodedFrame> {
-        self.tx.subscribe()
-    }
-    fn request_keyframe(&self) {}
-}
-
 use server as srv;
-use server::core_crate as srv_core;
 include!("../fixtures/app_state.rs");
 
 /// Shared fixture; see `crates/server/tests/fixtures/app_state.rs`.
@@ -147,6 +133,18 @@ pub fn mock_wda(
                 continue;
             };
             let request = String::from_utf8_lossy(&request[..read]).to_string();
+            // Session setup writes WDA's idle-wait settings. Answer them here,
+            // outside the script and its request index, so each test scripts
+            // only the traffic it is about.
+            if request.starts_with("POST ") && request.contains("/appium/settings") {
+                let body = r#"{"value":null}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                continue;
+            }
             let scripted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 responder(&request, index)
             }));
