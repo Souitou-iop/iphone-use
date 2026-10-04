@@ -2091,6 +2091,15 @@ async fn agent_status(
         .load(std::sync::atomic::Ordering::Relaxed);
     // `viewer_count` predates the MJPEG-only page; it is the same number now.
     let viewer_count = mjpeg_viewer_count;
+    // A watched picture that is blank because the app hides this screen from
+    // capture: clients overlay /agent/screenshot's wireframe (see `redaction`).
+    let capture_redacted = match &state.video {
+        Some(hub) => {
+            refresh_capture_verdict(&state, hub);
+            hub.capture_redacted()
+        }
+        None => false,
+    };
     let mjpeg_stream_age_ms = query.stream_id.as_deref().and_then(|stream_id| {
         recover(state.mjpeg_stream_activity.lock())
             .get(stream_id)
@@ -2241,7 +2250,7 @@ async fn agent_status(
     // up indefinitely, so `device_state:"ready"` alone says nothing about use.
     let idle_secs = state.idle_for().as_secs();
     let body = format!(
-        r#"{{"ok":true,"backend":"direct","instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"human_handoff":{human_handoff},"hold_remaining_secs":{hold_remaining},"idle_secs":{idle_secs},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#,
+        r#"{{"ok":true,"backend":"direct","instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"human_handoff":{human_handoff},"hold_remaining_secs":{hold_remaining},"idle_secs":{idle_secs},"hint":"{hint}","setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available}}}"#,
         crate::instance::current().name,
         serde_json::to_string(&state.device_udid).unwrap_or_else(|_| "null".into()),
         {
@@ -9237,7 +9246,81 @@ fn mark_wda_read_path_unactionable(state: &AppState) {
 /// this endpoint) — a logged-in viewer already sees these pixels as video, so the
 /// privilege is identical. The cookie is checked FIRST so browser polling never
 /// touches the bearer auth-limiter (5 misses there lock the agent API for 30s).
-async fn agent_screenshot(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+#[derive(Default, Deserialize)]
+struct ScreenshotQuery {
+    /// `raw=1`: the capture as WDA returned it, even when the app blanked it.
+    raw: Option<String>,
+}
+
+/// Decide again, in the background, whether a blank live picture is a screen
+/// the app hides from capture. Status polls drive it; at most one tree read
+/// per 8 s, and only while someone watches a blank picture.
+fn refresh_capture_verdict(state: &Arc<AppState>, hub: &Arc<crate::video::VideoHub>) {
+    if !hub.begin_verdict(std::time::Duration::from_secs(8)) {
+        return;
+    }
+    let Some(wda) = state.wda.clone() else {
+        hub.finish_verdict(None);
+        return;
+    };
+    let hub = Arc::clone(hub);
+    tokio::spawn(async move {
+        let verdict = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let mut w = wda.lock().await;
+            let rows = w.elements().await.ok()?;
+            let window = w.window_size().await.ok()?;
+            Some(crate::redaction::tree_has_hidden_content(&rows, window))
+        })
+        .await
+        .ok()
+        .flatten();
+        hub.finish_verdict(verdict);
+    });
+}
+
+/// Captures above this size have real content; a protected (flat) screen
+/// compresses to far less, so only small captures are decoded and checked.
+const REDACTION_CHECK_MAX_PNG_BYTES: usize = 600 * 1024;
+
+/// When the app hid this screen from capture (blank content band, labelled
+/// elements in the tree), the same capture with the tree drawn over it.
+async fn redacted_capture_wireframe(
+    wda: &Arc<tokio::sync::Mutex<crate::wda::WdaClient>>,
+    png: &[u8],
+) -> Option<Vec<u8>> {
+    if png.len() > REDACTION_CHECK_MAX_PNG_BYTES {
+        return None;
+    }
+    let png = png.to_vec();
+    let blank = tokio::task::spawn_blocking(move || {
+        let image = crate::redaction::decode_png(&png)?;
+        crate::redaction::content_band_is_blank(&image).then_some(image)
+    })
+    .await
+    .ok()??;
+    let (rows, window) = {
+        let mut w = wda.lock().await;
+        let rows = w.elements().await.ok()?;
+        let window = w.window_size().await.ok()?;
+        (rows, window)
+    };
+    if !crate::redaction::tree_has_hidden_content(&rows, window) {
+        return None;
+    }
+    tokio::task::spawn_blocking(move || {
+        let mut image = blank;
+        crate::redaction::draw_wireframe(&mut image, &rows, window);
+        crate::redaction::encode_png(&image)
+    })
+    .await
+    .ok()?
+}
+
+async fn agent_screenshot(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ScreenshotQuery>,
+) -> Response {
     // Match `/phone`: password=None intentionally makes the browser UI open.
     // A separate agent token still protects machine-only mutation endpoints.
     match browser_or_agent_auth(&state, &headers) {
@@ -9285,6 +9368,28 @@ async fn agent_screenshot(State(state): State<Arc<AppState>>, headers: HeaderMap
     .await
     {
         Ok(Ok(bytes)) if is_valid_png(&bytes) => {
+            if !query
+                .raw
+                .as_deref()
+                .is_some_and(|v| v == "1" || v == "true")
+            {
+                let wireframe = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    redacted_capture_wireframe(wda, &bytes),
+                )
+                .await
+                .ok()
+                .flatten();
+                if let Some(wireframe) = wireframe {
+                    let response = Response::builder()
+                        .header(header::CONTENT_TYPE, "image/png")
+                        .header("x-capture-redacted", "1")
+                        .header("x-screenshot-source", "accessibility-wireframe")
+                        .body(Body::from(wireframe))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                    return with_security_headers(response);
+                }
+            }
             let response = Response::builder()
                 .header(header::CONTENT_TYPE, "image/png")
                 .body(Body::from(bytes))
