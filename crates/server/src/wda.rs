@@ -996,6 +996,36 @@ impl WdaClient {
         Ok(())
     }
 
+    /// Bundle id of the foreground app (`GET /session/:sid/wda/apps/list`,
+    /// which lists only the active app and never walks its element tree —
+    /// unlike `wda/activeAppInfo`, see `probe_health`).
+    pub async fn active_bundle(&mut self) -> Result<Option<String>> {
+        Ok(self.active_bundles().await?.into_iter().next())
+    }
+
+    /// Every app iOS reports as active. More than one while SpringBoard shows
+    /// a notification banner over the foreground app.
+    pub async fn active_bundles(&mut self) -> Result<Vec<String>> {
+        let sid = self.ensure_session().await?.to_string();
+        let response = self
+            .http
+            .get(format!("{}/session/{}/wda/apps/list", self.base, sid))
+            .send_timed()
+            .await
+            .context("GET /wda/apps/list")?;
+        // ensure_wda_success already unwraps the W3C `value`.
+        let apps = ensure_wda_success(response, "GET /wda/apps/list").await?;
+        Ok(apps
+            .as_array()
+            .map(|apps| {
+                apps.iter()
+                    .filter_map(|app| app.get("bundleId").and_then(serde_json::Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// Open a URL on the device via WDA's **session-scoped** `POST /session/:sid/url`.
     ///
     /// appium-webdriveragent registers this route both with and without a
@@ -2139,6 +2169,20 @@ mod tests {
             .build()
             .unwrap()
             .block_on(future)
+    }
+
+    #[test]
+    fn active_bundles_lists_every_active_app_in_order() {
+        // Hardware shape while SpringBoard shows a banner over Shortcuts.
+        let (base, server) = mock_wda(1, |request| {
+            assert!(request.contains("/wda/apps/list"), "unexpected: {request}");
+            r#"{"value":[{"pid":11146,"bundleId":"com.apple.shortcuts"},{"pid":37,"bundleId":"com.apple.springboard"}],"sessionId":"SESSION"}"#.to_string()
+        });
+        let mut client = WdaClient::new(base).unwrap();
+        client.session = Some("SESSION".to_string());
+        let active = block(client.active_bundles()).unwrap();
+        assert_eq!(active, ["com.apple.shortcuts", "com.apple.springboard"]);
+        server.join().unwrap();
     }
 
     #[test]

@@ -424,6 +424,12 @@ pub struct AppState {
     /// only ever diffs against its own last read or two, and a miss degrades
     /// gracefully to the full tree.
     pub element_snapshots: Arc<Mutex<ElementSnapshotCache>>,
+    /// What the driving agent did in the current app, for `registry` hints,
+    /// `flow_suggestion` and `GET /agent/flow/draft` (see `crate::flows`).
+    pub flow_trail: Arc<Mutex<crate::flows::FlowTrail>>,
+    /// Whether this daemon turned Do Not Disturb on for the driving agent
+    /// (see `crate::focus`). Persisted across restarts.
+    pub agent_focus: Arc<Mutex<crate::focus::AgentFocus>>,
     /// Operator/agent "hold" lease: while set and in the future, the idle
     /// watchdog never releases the phone even with no recent actions — a human
     /// in the loop (typing a password, approving a prompt) otherwise trips the
@@ -647,10 +653,14 @@ async fn agent_owner(
         );
     }
     *recover(state.owner.lock()) = None;
+    let mut released = serde_json::json!({"ok": true, "owner": null});
+    if let Some(block) = release_agent_focus(&state).await {
+        released["agent_focus"] = block;
+    }
     with_security_headers(
         Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(r#"{"ok":true,"owner":null}"#))
+            .body(Body::from(released.to_string()))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
     )
 }
@@ -830,6 +840,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent/mjpeg", get(agent_mjpeg))
         .route("/agent/h264", get(agent_h264))
         .route("/agent/elements", get(agent_elements))
+        .route("/agent/flow/draft", get(agent_flow_draft))
+        .route("/agent/reference", get(agent_reference))
         // Shortcuts RPC return path: the phone POSTs structured results here.
         // Safe GET only peeks; destructive consumption has an explicit,
         // CSRF-protected POST endpoint.
@@ -3292,6 +3304,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
     // the next request brings the phone up on demand.
     if !launchd_job_loaded(&gui_domain(), wda_agent_label()) && wda_agent_disabled() {
         state.released.store(true, std::sync::atomic::Ordering::Release);
+        recover(state.flow_trail.lock()).reset();
         tracing::info!("WDA supervisor is parked (disabled); starting released");
     }
     let window = std::time::Duration::from_secs(idle_secs);
@@ -3401,6 +3414,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                     state.wda_actionable.store(false, Ordering::Relaxed);
                     *recover(state.wda_health.lock()) = crate::wda::WdaHealth::down();
                     state.released.store(true, Ordering::Release);
+                    recover(state.flow_trail.lock()).reset();
                     *recover(state.owner.lock()) = None;
                     release_backoff_until = None;
                     release_failures = 0;
@@ -3480,6 +3494,8 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 "idle {}s with no viewer — releasing the phone (stopping WDA)",
                 state.idle_for().as_secs()
             );
+            // While WDA is still up: give Do Not Disturb back first.
+            release_agent_focus(&state).await;
             let script = setup_sh.clone();
             let stopped = tokio::task::spawn_blocking(move || stop_wda_runner_blocking(&script))
                 .await
@@ -3496,6 +3512,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 state.wda_actionable.store(false, Ordering::Relaxed);
                 *recover(state.wda_health.lock()) = crate::wda::WdaHealth::down();
                 state.released.store(true, Ordering::Release);
+                recover(state.flow_trail.lock()).reset();
                 *recover(state.owner.lock()) = None;
                 was_up = false;
                 release_backoff_until = None;
@@ -4061,6 +4078,8 @@ async fn agent_mode(
                         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
                 );
             };
+            // The person gets their phone back with notifications on.
+            release_agent_focus(&state).await;
             let script = setup_sh.clone();
             let stopped = tokio::task::spawn_blocking(move || stop_wda_runner_blocking(&script))
                 .await
@@ -8066,6 +8085,11 @@ async fn agent_actions(
     if let Err(error) = validate_agent_actions(&request) {
         return agent_actions_invalid(error);
     }
+    // A flow run ends the agent's trail whether it passes or fails: what came
+    // before was its own task, and the run's steps are already a flow.
+    if headers.contains_key(FLOW_RUN_HEADER) {
+        recover(state.flow_trail.lock()).flow_ran();
+    }
     if state.managed_wda_pending {
         return target_not_configured_response();
     }
@@ -8102,6 +8126,10 @@ async fn agent_actions(
     };
 
     state.touch_activity();
+    let focus_block = engage_agent_focus(&state, &mut *wda.lock().await).await;
+    if let Some(waiting) = focus_permission_pending(focus_block.as_ref()) {
+        return waiting;
+    }
     let _priority = state.begin_wda_control();
     let batch_deadline = tokio::time::Instant::now() + AGENT_ACTIONS_DEADLINE;
     let mut w = match tokio::time::timeout_at(batch_deadline, wda.lock()).await {
@@ -8488,15 +8516,19 @@ async fn agent_actions(
         actionable: true,
         locked,
     };
-    agent_actions_json(
-        StatusCode::OK,
-        serde_json::json!({
-            "ok": true,
-            "completed": completed,
-            "applied_actions": applied_actions,
-            "steps": step_results
-        }),
-    )
+    let mut result = serde_json::json!({
+        "ok": true,
+        "completed": completed,
+        "applied_actions": applied_actions,
+        "steps": step_results
+    });
+    for (key, block) in flow_after_actions(&state, &headers, &body) {
+        result[key] = block;
+    }
+    if let Some(block) = recover(state.agent_focus.lock()).take_notice() {
+        result["agent_focus"] = block;
+    }
+    agent_actions_json(StatusCode::OK, result)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -9117,6 +9149,14 @@ async fn agent_input(
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         );
     };
+    // Do Not Disturb before the first action of a session; its time is not
+    // charged to the action's own budget.
+    let focus_started = tokio::time::Instant::now();
+    let focus_block = engage_agent_focus(&state, &mut *wda.lock().await).await;
+    if let Some(waiting) = focus_permission_pending(focus_block.as_ref()) {
+        return waiting;
+    }
+    let agent_wda_deadline = agent_wda_deadline + focus_started.elapsed();
     if tokio::time::Instant::now() >= agent_wda_deadline {
         return wda_deadline_response(false);
     }
@@ -9262,6 +9302,11 @@ async fn agent_input(
                 }
             };
             let body = attach_alert(body, alert);
+            let mut blocks = flow_after_input(&state, &headers, &value);
+            if let Some(block) = recover(state.agent_focus.lock()).take_notice() {
+                blocks.push(("agent_focus", block));
+            }
+            let body = attach_flow_blocks(body, blocks);
             with_security_headers(
                 Response::builder()
                     .header(header::CONTENT_TYPE, "application/json")
@@ -9302,6 +9347,455 @@ async fn agent_input(
         WdaControlOutcome::NoPageScroller(hint) => no_page_scroller_response(hint),
         WdaControlOutcome::Failed => wda_failed_after_dispatch_response(),
     }
+}
+
+/// The bridge shortcut to run for agent Do Not Disturb, when the feature is
+/// on: not opted out, not handed to a person, and the curated intents registry
+/// lists both active focus verbs.
+fn focus_bridge() -> Option<String> {
+    if crate::focus::opted_out() || human_handoff_active() {
+        return None;
+    }
+    let IntentsRegistryLoad::Loaded(registry) = load_intents_registry(&intents_registry_path()) else {
+        return None;
+    };
+    let active = |verb: &str| {
+        registry
+            .intents
+            .iter()
+            .any(|entry| entry.name == verb && entry.status == "active")
+    };
+    (active(crate::focus::FOCUS_ON_VERB) && active(crate::focus::FOCUS_OFF_VERB))
+        .then(|| registry.bridge_name.clone())
+}
+
+/// First control request of a session: ask the phone for Do Not Disturb, then
+/// put the foreground app back (the bridge shortcut opens the Shortcuts app).
+/// Best-effort — any failure leaves the request it precedes untouched.
+async fn engage_agent_focus(
+    state: &AppState,
+    w: &mut crate::wda::WdaClient,
+) -> Option<serde_json::Value> {
+    // Only the daemon's own phone: an external WDA endpoint belongs to
+    // someone else's setup (and test daemons never touch the real registry).
+    if !state.managed_wda || recover(state.agent_focus.lock()).attempted() {
+        return None;
+    }
+    let bridge = focus_bridge()?;
+    let previous = w.active_bundle().await.ok().flatten();
+    let link = intent_deep_link(
+        &bridge,
+        crate::focus::FOCUS_ON_VERB,
+        &new_intent_correlation_id(),
+        &serde_json::json!({}),
+    );
+    if let Err(error) = w.open_url(&link).await {
+        tracing::warn!("agent focus: could not open the bridge: {error:#}");
+        return None;
+    }
+    recover(state.agent_focus.lock()).mark_attempted();
+    let run = watch_bridge_run(w, &bridge, true).await;
+    // The notice is the evidence focus_on turned DND on. A run held by a
+    // prompt counts too: focus_on only prompts inside its "no Focus" branch.
+    let ours = run.saw_on_notice || !run.finished;
+    if ours {
+        recover(state.agent_focus.lock()).set(true);
+    }
+    if !run.finished {
+        // A one-time permission prompt over the Shortcuts app. Moving away
+        // would hide it and leave the run hanging: stay, let the agent answer.
+        tracing::warn!("agent focus: the bridge did not finish; leaving Shortcuts in front");
+        return Some(crate::focus::waiting_block());
+    }
+    let restored = match previous.as_deref() {
+        Some(bundle) if bundle != "com.apple.shortcuts" && bundle != "com.apple.springboard" => {
+            w.launch_app(bundle).await
+        }
+        _ => w.press_home().await,
+    };
+    if let Err(error) = restored {
+        tracing::warn!("agent focus: could not return to {previous:?}: {error:#}");
+    }
+    // The notice is SpringBoard's banner: while it is up, tree reads land on
+    // it instead of the app (hardware: the first tap_locator after DND came
+    // back element_not_found). Let it go before the agent's action runs.
+    if ours {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        while tokio::time::Instant::now() < deadline {
+            match w.active_bundles().await {
+                Ok(active) if !active.iter().any(|b| b == "com.apple.springboard") => break,
+                Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(400)).await,
+                Err(_) => break,
+            }
+        }
+    }
+    let block = if ours {
+        tracing::info!("agent focus: Do Not Disturb turned on (returned to {previous:?})");
+        crate::focus::engaged_block()
+    } else {
+        tracing::info!("agent focus: a Focus was already on; left alone");
+        crate::focus::already_focused_block()
+    };
+    // Delivered with the next successful response (see `take_focus_notice`).
+    recover(state.agent_focus.lock()).queue_notice(block);
+    None
+}
+
+/// The Do Not Disturb run is held by a permission prompt: refuse the action
+/// (`not_sent`, safe to retry) rather than dispatch it — an action would move
+/// the phone away and hide the prompt again, leaving the run hanging.
+fn focus_permission_pending(block: Option<&serde_json::Value>) -> Option<Response> {
+    let block = block?;
+    if block.get("do_not_disturb").and_then(serde_json::Value::as_str)
+        != Some("waiting_for_permission")
+    {
+        return None;
+    }
+    let body = serde_json::json!({
+        "ok": false,
+        "error": "focus_permission_pending",
+        "outcome": "not_sent",
+        "failed_step_outcome": "not_sent",
+        "batch_outcome": "nothing_applied",
+        "retry_safe": true,
+        "agent_focus": block,
+        "hint": "your action was NOT sent: answer the permission prompt on screen first (screenshot, tap 'Always Allow'), then send the action again"
+    });
+    Some(with_security_headers(
+        Response::builder()
+            .status(StatusCode::CONFLICT)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    ))
+}
+
+/// What one deep-link run of the bridge was seen to do.
+struct BridgeRun {
+    /// The Shortcuts library shows the bridge's idle run button again
+    /// (`shortcut.button.run`, labelled with the shortcut's name in every
+    /// language). `false` after [`crate::focus::SHORTCUT_RUN_TIMEOUT`].
+    finished: bool,
+    /// focus_on's notice banner was on screen during the run.
+    saw_on_notice: bool,
+}
+
+async fn watch_bridge_run(
+    w: &mut crate::wda::WdaClient,
+    bridge: &str,
+    look_for_notice: bool,
+) -> BridgeRun {
+    let deadline = tokio::time::Instant::now() + crate::focus::SHORTCUT_RUN_TIMEOUT;
+    let mut run = BridgeRun { finished: false, saw_on_notice: false };
+    // Give the deep link a moment to bring the Shortcuts app forward first,
+    // or the library from before the run reads as "already finished".
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    while tokio::time::Instant::now() < deadline {
+        // focus_off ends on the Home Screen, where the library never shows;
+        // poll only the cheap foreground-app query, never the (large)
+        // Shortcuts library tree.
+        if !look_for_notice {
+            // Order in the list varies; finished = Shortcuts is no longer active.
+            if let Ok(active) = w.active_bundles().await {
+                if !active.is_empty() && !active.iter().any(|b| b == "com.apple.shortcuts") {
+                    run.finished = true;
+                    return run;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            continue;
+        }
+        if let Ok(rows) = w.elements().await {
+            run.saw_on_notice |= look_for_notice
+                && rows.iter().any(|row| {
+                    row.label.contains(crate::focus::NOTICE_TITLE)
+                        && row.label.contains(crate::focus::ON_NOTICE)
+                });
+            if run.saw_on_notice {
+                // The notice is SpringBoard's banner, and while it is up the
+                // tree read lands on it rather than the library — so the tile
+                // cannot be watched. Setting DND is the step right after it.
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                run.finished = true;
+                return run;
+            }
+            run.finished = rows.iter().any(|row| {
+                row.kind == "Button"
+                    && row.identifier.as_deref() == Some("shortcut.button.run")
+                    // ends_with: "iU Bridge v4" must not match "…iU Bridge v4b".
+                    && row.label.trim_end().ends_with(bridge)
+            });
+            if run.finished {
+                // The banner stays up for seconds after the run; one more
+                // look if it was missed in the reads during the run.
+                if look_for_notice && !run.saw_on_notice {
+                    if let Ok(rows) = w.elements().await {
+                        run.saw_on_notice = rows.iter().any(|row| {
+                            row.label.contains(crate::focus::NOTICE_TITLE)
+                                && row.label.contains(crate::focus::ON_NOTICE)
+                        });
+                    }
+                }
+                return run;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    run
+}
+
+/// Give Do Not Disturb back — only when this session turned it on (see
+/// `engage_agent_focus`), so a Focus the person chose is never ended.
+/// Best-effort and bounded.
+async fn release_agent_focus(state: &AppState) -> Option<serde_json::Value> {
+    {
+        let mut focus = recover(state.agent_focus.lock());
+        if !focus.engaged() {
+            // Nothing of ours to undo; the next session tries afresh.
+            focus.set(false);
+            return None;
+        }
+    }
+    // Even opted out or handed off since: what was turned on goes back off.
+    let bridge = match load_intents_registry(&intents_registry_path()) {
+        IntentsRegistryLoad::Loaded(registry) => registry.bridge_name,
+        _ => return None,
+    };
+    let wda = state.wda.as_ref()?;
+    let link = intent_deep_link(
+        &bridge,
+        crate::focus::FOCUS_OFF_VERB,
+        &new_intent_correlation_id(),
+        &serde_json::json!({}),
+    );
+    let sent = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let mut w = wda.lock().await;
+        let opened = w.open_url(&link).await;
+        if opened.is_ok() && !watch_bridge_run(&mut w, &bridge, false).await.finished {
+            tracing::warn!("agent focus: focus_off did not finish (permission prompt?)");
+        }
+        opened
+    })
+    .await;
+    match sent {
+        Ok(Ok(())) => {
+            recover(state.agent_focus.lock()).set(false);
+            tracing::info!("agent focus: Do Not Disturb requested off");
+            Some(crate::focus::released_block())
+        }
+        Ok(Err(error)) => {
+            tracing::warn!("agent focus: could not open the bridge to release: {error:#}");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("agent focus: release timed out");
+            None
+        }
+    }
+}
+
+/// Header a flow runner sets on its batch: the steps are already a flow, so
+/// they end the current trail instead of joining it.
+const FLOW_RUN_HEADER: &str = "x-phone-flow-run";
+
+/// `registry` block for the first tree read in a newly entered app.
+fn flow_registry_for_tree(
+    state: &AppState,
+    rows: &[crate::wda::ElementRow],
+) -> Option<serde_json::Value> {
+    let label = active_application(rows);
+    let due = recover(state.flow_trail.lock()).saw_app(label.as_deref(), Instant::now());
+    if !due {
+        return None;
+    }
+    crate::flows::registry_block(crate::flows::AppKey::Label(label.as_deref()?))
+}
+
+/// The bundle a `launch_app` action opened, by id or by system-app name.
+fn launched_bundle(action: &serde_json::Value) -> Option<String> {
+    if action.get("type").and_then(serde_json::Value::as_str) != Some("launch_app") {
+        return None;
+    }
+    action
+        .get("bundle")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            action
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .and_then(system_app_bundle)
+        })
+        .map(str::to_string)
+}
+
+/// Record one applied action on the trail; returns the bundle it launched.
+fn record_flow_action(state: &AppState, action: &serde_json::Value, now: Instant) -> Option<String> {
+    let rows = action
+        .get("snapshot")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|snapshot| lookup_element_snapshot(state, snapshot));
+    let bundle = launched_bundle(action);
+    let mut trail = recover(state.flow_trail.lock());
+    if let Some(bundle) = &bundle {
+        trail.launched(bundle, now);
+        trail.record(
+            crate::flows::Converted::Step(serde_json::json!({"kind":"launch_app","bundle":bundle})),
+            now,
+        );
+    } else {
+        trail.record(crate::flows::convert_action(action, rows.as_deref().map(Vec::as_slice)), now);
+    }
+    bundle
+}
+
+/// `registry` (after a launch) and `flow_suggestion` (when due) for one
+/// applied `/agent/input` action.
+fn flow_after_input(
+    state: &AppState,
+    headers: &HeaderMap,
+    action: &serde_json::Value,
+) -> Vec<(&'static str, serde_json::Value)> {
+    if headers.contains_key(FLOW_RUN_HEADER) {
+        return Vec::new();
+    }
+    let launched = record_flow_action(state, action, Instant::now());
+    flow_blocks(state, launched)
+}
+
+/// The same for a successful `/agent/actions` batch, read from its raw body.
+fn flow_after_actions(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &str,
+) -> Vec<(&'static str, serde_json::Value)> {
+    if headers.contains_key(FLOW_RUN_HEADER) {
+        // Already rotated when the batch arrived (see agent_actions).
+        return Vec::new();
+    }
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let now = Instant::now();
+    let mut launched = None;
+    for step in request
+        .get("steps")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match step.get("kind").and_then(serde_json::Value::as_str) {
+            Some("action") => {
+                if let Some(action) = step.get("action") {
+                    if let Some(bundle) = record_flow_action(state, action, now) {
+                        launched = Some(bundle);
+                    }
+                }
+            }
+            Some("wait_for" | "pause") => {
+                recover(state.flow_trail.lock()).record_step(step.clone(), now)
+            }
+            _ => {}
+        }
+    }
+    flow_blocks(state, launched)
+}
+
+fn flow_blocks(state: &AppState, launched: Option<String>) -> Vec<(&'static str, serde_json::Value)> {
+    let mut blocks = Vec::new();
+    if let Some(block) = launched
+        .as_deref()
+        .and_then(|bundle| crate::flows::registry_block(crate::flows::AppKey::Bundle(bundle)))
+    {
+        blocks.push(("registry", block));
+    }
+    let suggestion = recover(state.flow_trail.lock())
+        .suggestion(&crate::flows::cooldown_path(), crate::flows::unix_day());
+    if let Some(block) = suggestion {
+        blocks.push(("flow_suggestion", block));
+    }
+    blocks
+}
+
+/// Merge flow blocks into a serialized JSON object body.
+fn attach_flow_blocks(body: String, blocks: Vec<(&'static str, serde_json::Value)>) -> String {
+    if blocks.is_empty() {
+        return body;
+    }
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(mut value) if value.is_object() => {
+            for (key, block) in blocks {
+                value[key] = block;
+            }
+            value.to_string()
+        }
+        _ => body,
+    }
+}
+
+/// The agent skill's reference half, compiled in so it always matches this
+/// daemon. The installer ships SKILL.md alone; SKILL.md points here.
+const AGENT_REFERENCE_MD: &str = include_str!("../../../skills/iphone-use/reference.md");
+
+/// `GET /agent/reference` — the skill reference (`text/markdown`).
+async fn agent_reference(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    match browser_or_agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+    with_security_headers(
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/markdown; charset=utf-8")
+            .body(Body::from(AGENT_REFERENCE_MD))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
+/// `GET /agent/flow/draft` — the current (or last finished) action trail as a
+/// flow v1 document plus a `todo` list. Typed text is never included; each
+/// typing step references a named input instead. 404 `no_trail` when nothing
+/// worth drafting has been recorded since the daemon started.
+async fn agent_flow_draft(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    match agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+    let draft = recover(state.flow_trail.lock()).draft();
+    let (status, body) = match draft {
+        Some(draft) => (StatusCode::OK, draft),
+        None => (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "ok": false,
+                "error": "no_trail",
+                "hint": "nothing recorded yet: drafts come from actions this daemon applied (single actions and batches, not flow runs) in one app since it started"
+            }),
+        ),
+    };
+    with_security_headers(
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
 }
 
 /// `GET /agent/elements` — the phone's element tree, flattened to
@@ -9495,6 +9989,9 @@ async fn agent_elements(
     };
     if let (Some(object), Some(alert)) = (body.as_object_mut(), alert_json(alert)) {
         object.insert("alert".to_string(), alert);
+    }
+    if let (Some(object), Some(registry)) = (body.as_object_mut(), flow_registry_for_tree(&state, &rows)) {
+        object.insert("registry".to_string(), registry);
     }
     match serde_json::to_string(&body) {
         Ok(body) => json_body(StatusCode::OK, body),
@@ -10203,7 +10700,7 @@ fn system_app_bundle(name: &str) -> Option<&'static str> {
         "文件" | "Files" | "files" => "com.apple.DocumentsApp",
         "快捷指令" | "Shortcuts" | "shortcuts" => "com.apple.shortcuts",
         "音乐" | "Music" | "music" => "com.apple.Music",
-        "App资源库" | "Find My" | "查找" => "com.apple.findmy",
+        "Find My" | "查找" => "com.apple.findmy",
         _ => return None,
     })
 }
