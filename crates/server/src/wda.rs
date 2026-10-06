@@ -866,25 +866,82 @@ impl WdaClient {
     /// before reporting success.
     pub async fn open_spotlight(&mut self) -> Result<()> {
         self.press_home().await?;
-        tokio::time::sleep(Duration::from_millis(450)).await;
 
-        let mut search_element = None;
-        for label in ["搜索", "Search", "検索"] {
-            let elements = self.find_elements("accessibility id", label).await?;
-            match elements.as_slice() {
-                [element] => {
-                    search_element = Some(element.clone());
+        // Poll rather than sleep a fixed 450 ms, but only once SpringBoard is
+        // the ONLY active app: until then the app being left may still answer
+        // for a "搜索" button of its own, and while a notification banner is up
+        // SpringBoard is listed next to that app in no fixed order. A WDA
+        // without `apps/list` gets the old fixed wait; one that answers but
+        // never shows SpringBoard alone is an error, not a search in the app.
+        // Every query is bounded by what is left of its phase's deadline.
+        let left = |deadline: std::time::Instant| {
+            deadline.saturating_duration_since(std::time::Instant::now())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut list_answered = false;
+        loop {
+            match tokio::time::timeout(left(deadline), self.active_bundles()).await {
+                Ok(Ok(bundles)) if bundles == ["com.apple.springboard"] => break,
+                Ok(Ok(_)) => list_answered = true,
+                Ok(Err(_)) if !list_answered => {
+                    tokio::time::sleep(Duration::from_millis(450)).await;
                     break;
                 }
-                [] => {}
-                _ => return Err(anyhow!("Spotlight Search element is ambiguous for {label}")),
+                Ok(Err(_)) | Err(_) => {}
             }
+            if std::time::Instant::now() >= deadline {
+                if list_answered {
+                    return Err(anyhow!(
+                        "the Home Screen did not come to the front, so Spotlight was not opened"
+                    ));
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let element =
-            search_element.ok_or_else(|| anyhow!("Spotlight Search element not found"))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let element = 'found: loop {
+            for label in ["搜索", "Search", "検索"] {
+                let Ok(elements) = tokio::time::timeout(
+                    left(deadline),
+                    self.find_elements("accessibility id", label),
+                )
+                .await
+                else {
+                    break;
+                };
+                match elements?.as_slice() {
+                    [element] => break 'found element.clone(),
+                    [] => {}
+                    _ => return Err(anyhow!("Spotlight Search element is ambiguous for {label}")),
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(anyhow!("Spotlight Search element not found"));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
         self.click_element(&element).await?;
-        tokio::time::sleep(Duration::from_millis(350)).await;
 
+        // Same for the search field: ask for it alone until it shows, then
+        // confirm on the full tree only if it never did.
+        let field = "type == 'XCUIElementTypeTextField' AND (label == 'SpotlightSearchField' \
+                     OR placeholderValue IN {'搜索', 'Search', '検索'})";
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let found = tokio::time::timeout(
+                left(deadline),
+                self.find_elements("predicate string", field),
+            )
+            .await;
+            if matches!(found, Ok(Ok(found)) if !found.is_empty()) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let rows = self.elements().await?;
         let opened = rows.iter().any(|row| {
             row.kind == "TextField"
@@ -1289,6 +1346,11 @@ impl WdaClient {
     /// too but touch nothing on screen; counting them would void every cache
     /// keyed on "nothing sent since" (the alert probe opens a session right
     /// after a tree read).
+    /// When the last request that can change the screen was sent.
+    pub fn last_post(&self) -> Option<std::time::Instant> {
+        self.posted_at
+    }
+
     fn post_req(&mut self, url: String) -> reqwest::RequestBuilder {
         let path = url.split('?').next().unwrap_or(&url);
         let read_only = path.ends_with("/session")
@@ -1529,7 +1591,11 @@ fn snapshot_settings(
 }
 
 /// One row of the flattened element tree.
+///
+/// Serialized through [`ElementRowJson`], which prints whole-point
+/// coordinates as `24`, not `24.0` — a fifth of every row was ".0".
 #[derive(Debug, Clone, Default, serde::Serialize, PartialEq)]
+#[serde(into = "ElementRowJson")]
 pub struct ElementRow {
     /// Element type without the `XCUIElementType` prefix (e.g. `Button`).
     pub kind: String,
@@ -1599,6 +1665,78 @@ pub struct ElementRow {
     /// system surface, not the page control underneath. Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overlay: Option<String>,
+}
+
+/// The wire form of [`ElementRow`]; field order and skip rules are the row's.
+#[derive(serde::Serialize)]
+pub struct ElementRowJson {
+    kind: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identifier: Option<String>,
+    rect: [Coordinate; 4],
+    depth: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visible: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accessible: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focused: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    placeholder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actions: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    traits: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overlay: Option<String>,
+}
+
+/// A point coordinate: an integer when it is whole, else as WDA gave it.
+struct Coordinate(f64);
+
+impl serde::Serialize for Coordinate {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.0.fract() == 0.0 && self.0.abs() < 1e15 {
+            serializer.serialize_i64(self.0 as i64)
+        } else {
+            serializer.serialize_f64(self.0)
+        }
+    }
+}
+
+impl From<ElementRow> for ElementRowJson {
+    fn from(row: ElementRow) -> Self {
+        Self {
+            kind: row.kind,
+            label: row.label,
+            identifier: row.identifier,
+            rect: row.rect.map(Coordinate),
+            depth: row.depth,
+            value: row.value,
+            enabled: row.enabled,
+            visible: row.visible,
+            accessible: row.accessible,
+            focused: row.focused,
+            placeholder: row.placeholder,
+            actions: row.actions,
+            selected: row.selected,
+            min: row.min,
+            max: row.max,
+            traits: row.traits,
+            overlay: row.overlay,
+        }
+    }
 }
 
 /// Which system overlay an accessibility identifier roots, if any. These are
@@ -2603,6 +2741,25 @@ mod tests {
         let first_cell = rows.iter().position(|r| r.kind == "Cell").unwrap();
         assert_eq!(rows[first_cell + 1].kind, "Button");
         assert_eq!(rows[first_cell + 1].label, "Country 001");
+    }
+
+    #[test]
+    fn row_json_prints_whole_points_as_integers_and_keeps_identifiers() {
+        let row = |identifier: &str, label: &str| ElementRow {
+            kind: "Button".to_string(),
+            label: label.to_string(),
+            identifier: Some(identifier.to_string()),
+            rect: [24.0, 66.5, 36.0, 0.0],
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&row("SidebarButton", "历史记录")).unwrap(),
+            r#"{"kind":"Button","label":"历史记录","identifier":"SidebarButton","rect":[24,66.5,36,0],"depth":0}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&row("AllClear", "AllClear")).unwrap(),
+            r#"{"kind":"Button","label":"AllClear","identifier":"AllClear","rect":[24,66.5,36,0],"depth":0}"#
+        );
     }
 
     #[test]
