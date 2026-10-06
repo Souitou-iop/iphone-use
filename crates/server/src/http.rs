@@ -2191,12 +2191,13 @@ async fn agent_status(
     // `hint` is for agents (diagnostic English); `advice` names the same
     // situation so `next_step` can tell a person what to do in one line —
     // the web page and the iOS app show that instead of translating `hint`.
+    let setup_hint = instance_setup_blocker_hint(&setup_blocked_on, crate::instance::current());
     let (advice, hint) = if releasing {
         ("releasing", "direct device service is being released after inactivity — wait for confirmation before reconnecting")
     } else if !wda {
         if state.managed_wda_pending {
             ("unconfigured", "no canonical iPhone target is configured — run setup-wda.sh to persist PHONE_REMOTE_UDID; until then the daemon will not stop or bootstrap local WDA")
-        } else if let Some(blocker_hint) = setup_blocker_hint(&setup_blocked_on) {
+        } else if let Some(blocker_hint) = setup_hint.as_deref() {
             ("blocker", blocker_hint)
         } else if reconnecting {
             ("reconnecting", "the daemon is restarting its managed direct device service — wait for reconnecting=false before retrying")
@@ -2235,6 +2236,7 @@ async fn agent_status(
     } else {
         ("", "")
     };
+    let hint_json = serde_json::to_string(&hint).unwrap_or_else(|_| "\"\"".into());
     let next_step_json = human_next_step(advice, &setup_blocked_on, wda_died_reason)
         .map(|(zh, en)| serde_json::json!({ "zh": zh, "en": en }).to_string())
         .unwrap_or_else(|| "null".to_string());
@@ -2284,7 +2286,7 @@ async fn agent_status(
     let transport_hint = serde_json::to_string(&transport_hint(transport, rtt))
         .unwrap_or_else(|_| "null".into());
     let body = format!(
-        r#"{{"ok":true,"backend":"direct","instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"human_handoff":{human_handoff},"hold_remaining_secs":{hold_remaining},"idle_secs":{idle_secs},"hint":"{hint}","next_step":{next_step_json},"setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"transport":"{transport}","wda_rtt_ms":{rtt_json},"transport_hint":{transport_hint}}}"#,
+        r#"{{"ok":true,"backend":"direct","instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"released":{released},"human_handoff":{human_handoff},"hold_remaining_secs":{hold_remaining},"idle_secs":{idle_secs},"hint":{hint_json},"next_step":{next_step_json},"setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"transport":"{transport}","wda_rtt_ms":{rtt_json},"transport_hint":{transport_hint}}}"#,
         crate::instance::current().name,
         serde_json::to_string(&state.device_udid).unwrap_or_else(|_| "null".into()),
         {
@@ -2553,6 +2555,26 @@ fn human_next_step(
         ),
         _ => return None,
     })
+}
+
+/// [`setup_blocker_hint`] for a specific instance: the `wda` blocker names
+/// that instance's own setup log and helper, not the default instance's
+/// `~/.iphone-use` (#126). A second phone keeps its state elsewhere.
+fn instance_setup_blocker_hint(
+    blocked_on: &str,
+    instance: &crate::instance::Instance,
+) -> Option<std::borrow::Cow<'static, str>> {
+    if blocked_on == "wda" {
+        return Some(
+            format!(
+                "WebDriverAgent failed to start — inspect {} and run {} doctor before retrying",
+                instance.agent_log().display(),
+                instance.setup_sh().display(),
+            )
+            .into(),
+        );
+    }
+    setup_blocker_hint(blocked_on).map(Into::into)
 }
 
 fn setup_blocker_hint(blocked_on: &str) -> Option<&'static str> {
@@ -14197,6 +14219,28 @@ mod tests {
         assert!(locked.contains("on its own"), "{locked}");
         assert!(!locked.contains("wda-agent.log"), "{locked}");
         assert!(!locked.contains("doctor"), "{locked}");
+    }
+
+    #[test]
+    fn wda_blocker_hint_names_the_instance_log_not_the_default_one() {
+        // #126: a second phone keeps its state outside ~/.iphone-use, so the
+        // hint must send the operator to that instance's own log and helper.
+        let second = crate::instance::Instance::derive("i14", "/Users/x", None).unwrap();
+        let hint = instance_setup_blocker_hint("wda", &second).unwrap();
+        assert!(hint.contains(&second.agent_log().display().to_string()), "{hint}");
+        assert!(hint.contains(&second.setup_sh().display().to_string()), "{hint}");
+        assert!(!hint.contains("~/.iphone-use"), "{hint}");
+
+        let default = crate::instance::Instance::derive("", "/Users/x", None).unwrap();
+        let hint = instance_setup_blocker_hint("wda", &default).unwrap();
+        assert!(hint.contains("/Users/x/.iphone-use/wda-agent.log"), "{hint}");
+
+        // Every other blocker keeps its instance-independent text.
+        assert_eq!(
+            instance_setup_blocker_hint("locked", &second).as_deref(),
+            setup_blocker_hint("locked")
+        );
+        assert!(instance_setup_blocker_hint("", &second).is_none());
     }
 
     #[test]
