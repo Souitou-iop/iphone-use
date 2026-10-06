@@ -149,6 +149,11 @@ pub struct RunStepsParams {
     /// first action and stops immediately when any action or wait condition
     /// fails.
     pub steps: Vec<PhoneStep>,
+    /// Return the screen the batch ended on (`snapshot`, `elements`, `alert`)
+    /// in the same reply, so the next decision needs no phone_elements call.
+    /// Default true; set false only when you will not look at the result.
+    #[serde(default)]
+    pub observe: Option<bool>,
 }
 
 /// One step in a bounded multi-step Direct/WDA sequence.
@@ -384,6 +389,20 @@ pub struct FlowRunParams {
     /// only). Only after checking the values are right.
     #[serde(default)]
     pub write_fixture: bool,
+}
+
+/// Parameters for [`phone_jev_run`].
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct JevRunParams {
+    /// The whole goal in plain language, with every value it needs
+    /// ("In Settings, turn on Low Power Mode"). Jev never invents personal data.
+    pub goal: String,
+    /// Bundle id to launch first, e.g. `com.apple.Preferences`.
+    #[serde(default)]
+    pub app: Option<String>,
+    /// Step budget (default 30).
+    #[serde(default)]
+    pub max_steps: Option<usize>,
 }
 
 /// Parameters for [`phone_flow_draft`].
@@ -645,7 +664,9 @@ impl PhoneHandler {
     // -----------------------------------------------------------------------
 
     #[tool(
-        description = "Run a sequence of actions in ONE call: the daemon validates the whole \
+        description = "THE DEFAULT WAY TO ACT: run a sequence of actions in ONE call and get the \
+        screen it ended on back in the same reply (observe, on by default) — one turn instead of one \
+        per tap. The daemon validates the whole \
         sequence first, holds one control lock, and stops at the first failure. Use it as soon as a \
         segment is understood; keep single-action tools for exploring an unknown screen. Step kinds: \
         launch_app, tap_locator, tap_label, tap, type, key, shortcut, scroll, swipe, drag, longpress, \
@@ -658,12 +679,17 @@ impl PhoneHandler {
     )]
     async fn phone_run_steps(
         &self,
-        Parameters(RunStepsParams { steps }): Parameters<RunStepsParams>,
+        Parameters(RunStepsParams { steps, observe }): Parameters<RunStepsParams>,
     ) -> CallToolResult {
-        let request = match phone_steps_request(steps) {
+        let mut request = match phone_steps_request(steps) {
             Ok(request) => request,
             Err(error) => return CallToolResult::error(vec![Content::text(error)]),
         };
+        // Observing by default: a batch is how an agent advances, and the
+        // screen it ends on is what the agent decides from next.
+        if observe.unwrap_or(true) {
+            request["observe"] = serde_json::json!(true);
+        }
         // The batch entry point answers with the same structured result the
         // CLI and phone_flow_run do. A failing batch carries the evidence a
         // caller needs — `failed_step`, `applied_actions`, `retry_safe`, and
@@ -1133,6 +1159,34 @@ impl PhoneHandler {
     }
 
     #[tool(
+        description = "Hand ONE whole goal to a fast on-phone agent instead of driving it step by \
+        step: TypeSafe's Jev picks each next operation and target from the screen's element table \
+        (~1–2 s per step instead of a model turn), a small LLM types field values. Use it for a \
+        clear multi-step goal with no saved flow (check phone_flow_list first). It stops with \
+        status done / blocked / max_steps and the step history; it answers BLOCKED rather than \
+        send, pay, delete or share anything the goal did not explicitly ask for — still confirm \
+        such goals with the user first. Verify the end screen yourself. Needs TYPESAFE_API_KEY \
+        (or ~/.config/typesafe/key) and, for typing, TEXT_MODEL_API_KEY (or ~/.config/openrouter/key)."
+    )]
+    async fn phone_jev_run(
+        &self,
+        Parameters(JevRunParams { goal, app, max_steps }): Parameters<JevRunParams>,
+    ) -> CallToolResult {
+        let options = crate::jev::Options {
+            goal,
+            app,
+            max_steps: max_steps.unwrap_or(crate::jev::DEFAULT_MAX_STEPS).clamp(1, 80),
+        };
+        match crate::jev::run(&self.daemon, options).await {
+            Ok(report) if report["ok"] == true => {
+                CallToolResult::success(vec![Content::text(report.to_string())])
+            }
+            Ok(report) => CallToolResult::error(vec![Content::text(report.to_string())]),
+            Err(e) => CallToolResult::error(vec![Content::text(format!("jev did not run: {e:#}"))]),
+        }
+    }
+
+    #[tool(
         description = "Turn what you just did on the phone into a flow. The daemon records \
         every action it applied in the current app (single actions and phone_run_steps \
         batches, not flow runs); this returns that trail as a flow v1 document (snapshot \
@@ -1326,9 +1380,12 @@ impl ServerHandler for PhoneHandler {
                  (each reconnect may make the user type the passcode), never for health checks.\n\
                  2. Look for a saved flow FIRST. Responses that enter an app (launch_app, the first \
                  phone_elements in a new app) carry a `registry` block: if a listed flow does the task, \
-                 phone_flow_run it — one call instead of dozens. phone_flow_list shows all of them.\n\
+                 phone_flow_run it — one call instead of dozens. phone_flow_list shows all of them. No flow but a \
+                 clear goal: phone_jev_run hands the whole goal to a fast on-phone agent (~1–2 s/step).\n\
                  3. Otherwise read phone_elements and act on what it names (phone_tap_element, \
-                 phone_tap_label for a unique label); batch a segment you understand with phone_run_steps. \
+                 phone_tap_label for a unique label) only to explore; as soon as you know the next few steps, send \
+                 them as ONE phone_run_steps batch (wait_for between screens) — it returns the resulting \
+                 screen, so a task takes a few turns, not one per tap. \
                  Screenshots only when pixels matter.\n\
                  4. Verify each step; `retry_safe:false` means never replay.\n\
                  5. A response carrying `flow_suggestion`, or any finished multi-step task with no flow: \
@@ -2073,6 +2130,7 @@ mod tests {
                 y: 0.5,
                 after_ms: 0,
             }],
+            observe: None,
         })));
         task.join().unwrap();
 
@@ -2210,10 +2268,11 @@ mod tests {
 
         assert_eq!(
             names.len(),
-            22,
+            23,
             "tool count changed; update README, the skill, and the CI assertion: {names:?}"
         );
         for required in [
+            "phone_jev_run",
             "phone_flow_draft",
             "phone_capabilities",
             "phone_status",
