@@ -11,6 +11,7 @@
 #   ./scripts/setup-wda.sh stop       # stop WDA runner + relay
 #   ./scripts/setup-wda.sh pause      # give the phone back; disable auto-restart
 #   ./scripts/setup-wda.sh resume     # re-enable the managed WDA supervisor
+#   ./scripts/setup-wda.sh instance-context  # read-only: resolved paths/ports
 #
 # Env overrides:
 #   WDA_UDID=...        target device UDID (default: first xcodebuild iOS device)
@@ -22,8 +23,11 @@
 #   WDA_DIR=...         WDA checkout    (default: ~/.iphone-use/WebDriverAgent)
 #   WDA_REF=...         exact upstream commit (default: pinned v9.15.3 commit)
 #   WDA_RUNNER_ICON=... runner icon: auto, none, or a local .png/.icns (default: auto)
-#   WDA_PORT=...        relay port      (default: 8100)
-#   MJPEG_PORT=...      video relay port (default: 9100)
+#   WDA_PORT=...        relay port      (default: 8100; named instances: derived)
+#   MJPEG_PORT=...      video relay port (default: 9100; named instances: derived)
+#   PHONE_REMOTE_INSTANCE=... which daemon/phone pair (default: default). A named
+#                       instance keeps its state, checkout, launchd labels and
+#                       ports apart and requires an explicit target UDID (#67).
 #   WDA_ALLOW_LAN=1     permit unauthenticated WDA over LAN (unsafe; default off)
 #
 # Requirements: Xcode (an Apple ID in Settings → Accounts, or WDA_ASC_* signing),
@@ -37,8 +41,230 @@ umask 077
 # live outside it. Extend deterministically rather than relying on the shell.
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
 
-STATE_DIR="$HOME/.iphone-use"
 COMMAND="${1:-setup}"
+
+# BEGIN instance context (#67). One daemon drives one phone; everything this
+# script names on the Mac derives from PHONE_REMOTE_INSTANCE the same way
+# crates/server/src/instance.rs does (pinned by
+# scripts/fixtures/instance-derivation.json). `default` keeps every path, label
+# and port a single-phone install has always used.
+INSTANCE_LABEL_PREFIX="com.leeguoo.iphone-use"
+# `wda` would collide with the default WDA label; the rest are the product's
+# other LaunchAgents, which share the label namespace.
+INSTANCE_RESERVED_NAMES="wda autoupdate daily-maintenance flow-reverify"
+# Named instances take a deterministic slot so a rerun picks the same ports;
+# a slot whose ports another instance claims, or something listens on, is
+# skipped. Persisted ports always win over derivation.
+INSTANCE_PORT_SLOTS=500
+INSTANCE_DAEMON_PORT_BASE=45500
+INSTANCE_WDA_PORT_BASE=8200
+INSTANCE_MJPEG_PORT_BASE=9200
+
+_instance_name_valid() {
+    local name="$1" reserved
+    printf '%s' "$name" | LC_ALL=C grep -Eq '^[a-z][a-z0-9-]{0,31}$' || return 1
+    [ "$(printf '%s' "$name" | wc -l | tr -d ' ')" = "0" ] || return 1
+    for reserved in $INSTANCE_RESERVED_NAMES; do
+        [ "$name" != "$reserved" ] || return 1
+    done
+}
+
+_instance_state_dir_override_valid() {
+    local dir="$1" base="$HOME/.iphone-use"
+    case "$dir" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    case "/$dir/" in
+        */./*|*/../*) return 1 ;;
+    esac
+    case "$dir" in
+        /|"$HOME"|"$HOME/"|"$base"|"$base"/*|*$'\n'*|*$'\r'*) return 1 ;;
+    esac
+    case "$base/" in
+        "${dir%/}"/*) return 1 ;;
+    esac
+}
+
+# Sets INSTANCE_NAME, STATE_DIR, WDA_AGENT_LABEL, DAEMON_LABEL from the
+# environment and, for an installed copy, from where this script lives: the
+# copy under ~/.iphone-use/instances/<name>/ is that instance's and refuses to
+# run as any other.
+_instance_resolve() {
+    local requested="${PHONE_REMOTE_INSTANCE-}" self installed=""
+    self="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+    case "$self" in
+        "$HOME/.iphone-use/instances/"*/setup-wda.sh)
+            installed="${self#"$HOME/.iphone-use/instances/"}"
+            installed="${installed%/setup-wda.sh}"
+            ;;
+        "$HOME/.iphone-use/setup-wda.sh") installed=default ;;
+    esac
+    [ -n "$requested" ] || requested="${installed:-default}"
+    if [ "$requested" != default ] && ! _instance_name_valid "$requested"; then
+        printf 'PHONE_REMOTE_INSTANCE="%s" is not a valid instance name: lowercase [a-z][a-z0-9-], at most 32 chars, not one of: %s\n' \
+            "$requested" "$INSTANCE_RESERVED_NAMES" >&2
+        exit 2
+    fi
+    if [ -n "$installed" ] && [ "$installed" != "$requested" ] \
+        && [ -z "${PHONE_REMOTE_STATE_DIR:-}" ]; then
+        printf 'this setup-wda.sh belongs to instance "%s" but PHONE_REMOTE_INSTANCE is "%s"; run %s instead\n' \
+            "$installed" "$requested" \
+            "$([ "$requested" = default ] && printf '%s' "$HOME/.iphone-use/setup-wda.sh" \
+                || printf '%s' "$HOME/.iphone-use/instances/$requested/setup-wda.sh")" >&2
+        exit 2
+    fi
+    INSTANCE_NAME="$requested"
+    if [ "$INSTANCE_NAME" = default ]; then
+        STATE_DIR="$HOME/.iphone-use"
+        DAEMON_LABEL="$INSTANCE_LABEL_PREFIX"
+        WDA_AGENT_LABEL="$INSTANCE_LABEL_PREFIX.wda"
+    else
+        STATE_DIR="$HOME/.iphone-use/instances/$INSTANCE_NAME"
+        DAEMON_LABEL="$INSTANCE_LABEL_PREFIX.$INSTANCE_NAME"
+        WDA_AGENT_LABEL="$INSTANCE_LABEL_PREFIX.wda.$INSTANCE_NAME"
+    fi
+    if [ -n "${PHONE_REMOTE_STATE_DIR:-}" ]; then
+        if ! _instance_state_dir_override_valid "$PHONE_REMOTE_STATE_DIR"; then
+            printf 'PHONE_REMOTE_STATE_DIR="%s" must be absolute, free of . and .., not / or HOME, and outside ~/.iphone-use\n' \
+                "$PHONE_REMOTE_STATE_DIR" >&2
+            exit 2
+        fi
+        STATE_DIR="${PHONE_REMOTE_STATE_DIR%/}"
+    fi
+    export PHONE_REMOTE_INSTANCE="$INSTANCE_NAME"
+}
+
+# Every other instance's plists, as "<instance> <plist>" lines. Only plists
+# that carry a phone or a port count; the product's maintenance agents share
+# the label prefix but bind neither.
+_instance_other_plists() {
+    local plist label name
+    for plist in "$HOME/Library/LaunchAgents/$INSTANCE_LABEL_PREFIX".plist \
+        "$HOME/Library/LaunchAgents/$INSTANCE_LABEL_PREFIX".*.plist; do
+        [ -f "$plist" ] || continue
+        label="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$plist" 2>/dev/null || true)"
+        case "$label" in
+            "$INSTANCE_LABEL_PREFIX") name=default ;;
+            "$INSTANCE_LABEL_PREFIX.wda") name=default ;;
+            "$INSTANCE_LABEL_PREFIX.wda."*) name="${label#"$INSTANCE_LABEL_PREFIX.wda."}" ;;
+            "$INSTANCE_LABEL_PREFIX."*) name="${label#"$INSTANCE_LABEL_PREFIX."}" ;;
+            *) continue ;;
+        esac
+        [ "$name" != "$INSTANCE_NAME" ] || continue
+        case " $INSTANCE_RESERVED_NAMES " in
+            *" $name "*) continue ;;
+        esac
+        printf '%s %s\n' "$name" "$plist"
+    done
+}
+
+_instance_plist_env() {
+    /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$2" "$1" 2>/dev/null || true
+}
+
+# Ports other instances own: what their plists persist, plus the default
+# instance's built-in defaults, which an older plist may leave implicit.
+_instance_claimed_ports() {
+    local name plist key value
+    if [ "$INSTANCE_NAME" != default ]; then
+        printf '44321\n8100\n9100\n'
+    fi
+    while read -r name plist; do
+        for key in PHONE_REMOTE_PORT WDA_PORT MJPEG_PORT \
+            PHONE_REMOTE_WDA_URL PHONE_REMOTE_WDA_MJPEG_URL; do
+            value="$(_instance_plist_env "$plist" "$key")"
+            value="$(printf '%s' "$value" | sed -n 's#^http://127\.0\.0\.1:\([0-9][0-9]*\).*$#\1#p;s#^\([0-9][0-9]*\)$#\1#p')"
+            [ -z "$value" ] || printf '%s\n' "$value"
+        done
+    done < <(_instance_other_plists)
+}
+
+# The instance a UDID is already bound to, if it is not this one.
+_instance_udid_owner() {
+    local wanted name plist key value
+    wanted="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+    [ -n "$wanted" ] || return 1
+    while read -r name plist; do
+        for key in PHONE_REMOTE_UDID WDA_UDID; do
+            value="$(_instance_plist_env "$plist" "$key" | tr '[:lower:]' '[:upper:]')"
+            if [ -n "$value" ] && [ "$value" = "$wanted" ]; then
+                printf '%s\n' "$name"
+                return 0
+            fi
+        done
+    done < <(_instance_other_plists)
+    return 1
+}
+
+_instance_port_listening() {
+    command -v lsof >/dev/null 2>&1 || return 1
+    [ -n "$(lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -1)" ]
+}
+
+# First-choice slot for a name: cksum is POSIX, so every shell agrees.
+_instance_port_slot() {
+    local sum
+    sum="$(printf '%s' "$1" | cksum | awk '{ print $1 }')"
+    printf '%s\n' $((sum % INSTANCE_PORT_SLOTS))
+}
+
+# Sets INSTANCE_SLOT_DAEMON_PORT/WDA_PORT/MJPEG_PORT to the first slot from the
+# name's own whose three ports are unclaimed and free. With PROBE=0 the
+# first-choice slot is returned unchecked (what the fixture pins).
+_instance_derive_ports() {
+    local probe="${1:-1}" slot attempt claimed d w m
+    slot="$(_instance_port_slot "$INSTANCE_NAME")"
+    claimed=" $(_instance_claimed_ports | tr '\n' ' ') "
+    attempt=0
+    while [ "$attempt" -lt 20 ]; do
+        d=$((INSTANCE_DAEMON_PORT_BASE + (slot + attempt) % INSTANCE_PORT_SLOTS))
+        w=$((INSTANCE_WDA_PORT_BASE + (slot + attempt) % INSTANCE_PORT_SLOTS))
+        m=$((INSTANCE_MJPEG_PORT_BASE + (slot + attempt) % INSTANCE_PORT_SLOTS))
+        if [ "$probe" = 0 ]; then
+            break
+        fi
+        case "$claimed" in
+            *" $d "*|*" $w "*|*" $m "*) ;;
+            *)
+                if ! _instance_port_listening "$d" && ! _instance_port_listening "$w" \
+                    && ! _instance_port_listening "$m"; then
+                    break
+                fi
+                ;;
+        esac
+        attempt=$((attempt + 1))
+    done
+    [ "$attempt" -lt 20 ] || return 1
+    INSTANCE_SLOT_DAEMON_PORT="$d"
+    INSTANCE_SLOT_WDA_PORT="$w"
+    INSTANCE_SLOT_MJPEG_PORT="$m"
+}
+
+# Refuse ports another instance owns and a phone another instance drives.
+_instance_check_bindings() {
+    local claimed port owner
+    claimed=" $(_instance_claimed_ports | tr '\n' ' ') "
+    for port in "$@"; do
+        [ -n "$port" ] || continue
+        case "$claimed" in
+            *" $port "*)
+                printf 'TCP %s is already assigned to another iphone-use instance; pick a different port for instance "%s"\n' \
+                    "$port" "$INSTANCE_NAME" >&2
+                return 1
+                ;;
+        esac
+    done
+    if [ -n "${WDA_UDID:-}" ] && owner="$(_instance_udid_owner "$WDA_UDID")"; then
+        printf 'iPhone %s is already driven by iphone-use instance "%s"; one phone cannot be bound to two daemons\n' \
+            "$WDA_UDID" "$owner" >&2
+        return 1
+    fi
+}
+
+_instance_resolve
+# END instance context.
+
 WDA_CHECKOUT_MARKER="$STATE_DIR/wda-checkout-owner.v1"
 RUN_LOG="$STATE_DIR/wda-runner.log"
 RUNNER_PID_FILE="$STATE_DIR/wda-runner.pid"
@@ -46,12 +272,10 @@ RELAY_PID_FILE="$STATE_DIR/wda-relay.pid"
 WDA_REPO="https://github.com/appium/WebDriverAgent.git"
 DEFAULT_WDA_REF="54f9fc702b5ba40249017a4b9bf48c69b757389b"
 DEFAULT_WDA_REF_TAG="v9.15.3"
-WDA_AGENT_LABEL="com.leeguoo.iphone-use.wda"
 WDA_AGENT_PLIST="$HOME/Library/LaunchAgents/$WDA_AGENT_LABEL.plist"
 WDA_AGENT_LOG="$STATE_DIR/wda-agent.log"
 WDA_RETRY_STATE="$STATE_DIR/wda-retry-state.v1"
 WDA_AGENT_ROLLBACK_PLIST="$STATE_DIR/wda-supervisor.rollback.$$.plist"
-DAEMON_LABEL="com.leeguoo.iphone-use"
 DAEMON_PLIST="$HOME/Library/LaunchAgents/$DAEMON_LABEL.plist"
 DAEMON_ROLLBACK_PLIST="$STATE_DIR/daemon.rollback.$$.plist"
 UID_NUM="$(id -u)"
@@ -99,14 +323,31 @@ _port_from_daemon_url() {
 
 # Preserve setup-owned supervisor policy on a plain rerun. Precedence is:
 # explicit environment > existing WDA supervisor > daemon endpoint > default.
+# A named instance has its own checkout, so its DerivedData (keyed by project
+# path) never mixes with another instance's build.
 WDA_DIR="${WDA_DIR:-$(_existing_wda_env WDA_DIR)}"
-WDA_DIR="${WDA_DIR:-$HOME/.iphone-use/WebDriverAgent}"
+WDA_DIR="${WDA_DIR:-$STATE_DIR/WebDriverAgent}"
 WDA_PORT="${WDA_PORT:-$(_existing_wda_env WDA_PORT)}"
 WDA_PORT="${WDA_PORT:-$(_port_from_daemon_url PHONE_REMOTE_WDA_URL)}"
-WDA_PORT="${WDA_PORT:-8100}"
 MJPEG_PORT="${MJPEG_PORT:-$(_existing_wda_env MJPEG_PORT)}"
 MJPEG_PORT="${MJPEG_PORT:-$(_port_from_daemon_url PHONE_REMOTE_WDA_MJPEG_URL)}"
-MJPEG_PORT="${MJPEG_PORT:-9100}"
+if [ "$INSTANCE_NAME" = default ]; then
+    WDA_PORT="${WDA_PORT:-8100}"
+    MJPEG_PORT="${MJPEG_PORT:-9100}"
+elif [ -z "$WDA_PORT" ] || [ -z "$MJPEG_PORT" ]; then
+    # The installer persists the named daemon's relay ports; derive only for a
+    # setup that runs before it (the daemon port is the installer's concern).
+    WDA_PORT="${WDA_PORT:-$(_existing_daemon_env WDA_PORT)}"
+    MJPEG_PORT="${MJPEG_PORT:-$(_existing_daemon_env MJPEG_PORT)}"
+    if [ -z "$WDA_PORT" ] || [ -z "$MJPEG_PORT" ]; then
+        _instance_derive_ports 1 || {
+            printf 'no free port slot for instance "%s"; set WDA_PORT and MJPEG_PORT\n' "$INSTANCE_NAME" >&2
+            exit 1
+        }
+        WDA_PORT="${WDA_PORT:-$INSTANCE_SLOT_WDA_PORT}"
+        MJPEG_PORT="${MJPEG_PORT:-$INSTANCE_SLOT_MJPEG_PORT}"
+    fi
+fi
 WDA_BUNDLE_ID="${WDA_BUNDLE_ID:-$(_existing_wda_env WDA_BUNDLE_ID)}"
 WDA_TEAM_ID="${WDA_TEAM_ID:-$(_existing_wda_env WDA_TEAM_ID)}"
 # Restore the saved trio only when no ASC override was supplied. A partial
@@ -115,6 +356,20 @@ if [ "${WDA_ASC_KEY_PATH+x}${WDA_ASC_KEY_ID+x}${WDA_ASC_ISSUER_ID+x}" = "" ]; th
     WDA_ASC_KEY_PATH="$(_existing_wda_env WDA_ASC_KEY_PATH)"
     WDA_ASC_KEY_ID="$(_existing_wda_env WDA_ASC_KEY_ID)"
     WDA_ASC_ISSUER_ID="$(_existing_wda_env WDA_ASC_ISSUER_ID)"
+fi
+# A named instance's first setup has no supervisor yet: its signing policy is
+# whatever `install.sh --instance` persisted in the daemon plist, taken as a
+# set (the three ASC keys never mix with a different saved key).
+if [ "$INSTANCE_NAME" != default ]; then
+    WDA_BUNDLE_ID="${WDA_BUNDLE_ID:-$(_existing_daemon_env WDA_BUNDLE_ID)}"
+    WDA_TEAM_ID="${WDA_TEAM_ID:-$(_existing_daemon_env WDA_TEAM_ID)}"
+    WDA_REF="${WDA_REF:-$(_existing_daemon_env WDA_REF)}"
+    WDA_ALLOW_LAN="${WDA_ALLOW_LAN:-$(_existing_daemon_env WDA_ALLOW_LAN)}"
+    if [ "${WDA_ASC_KEY_PATH:-}${WDA_ASC_KEY_ID:-}${WDA_ASC_ISSUER_ID:-}" = "" ]; then
+        WDA_ASC_KEY_PATH="$(_existing_daemon_env WDA_ASC_KEY_PATH)"
+        WDA_ASC_KEY_ID="$(_existing_daemon_env WDA_ASC_KEY_ID)"
+        WDA_ASC_ISSUER_ID="$(_existing_daemon_env WDA_ASC_ISSUER_ID)"
+    fi
 fi
 WDA_REF="${WDA_REF:-$(_existing_wda_env WDA_REF)}"
 WDA_REF="${WDA_REF:-$DEFAULT_WDA_REF}"
@@ -149,6 +404,43 @@ case "$WDA_ALLOW_LAN" in
     0|1) ;;
     *) printf 'WDA_ALLOW_LAN must be 0 or 1\n' >&2; exit 1 ;;
 esac
+
+# Read-only: what this instance resolves to, for install.sh/uninstall.sh and
+# the fixture test. Exits non-zero when a port or the phone is already bound
+# to another instance, before anything is touched.
+if [ "$COMMAND" = "instance-context" ]; then
+    _instance_derive_ports 0
+    INSTANCE_FIRST_DAEMON_PORT="$INSTANCE_SLOT_DAEMON_PORT"
+    INSTANCE_FIRST_WDA_PORT="$INSTANCE_SLOT_WDA_PORT"
+    INSTANCE_FIRST_MJPEG_PORT="$INSTANCE_SLOT_MJPEG_PORT"
+    INSTANCE_DAEMON_PORT="${PHONE_REMOTE_PORT:-$(_existing_daemon_env PHONE_REMOTE_PORT)}"
+    if [ -z "$INSTANCE_DAEMON_PORT" ]; then
+        if [ "$INSTANCE_NAME" = default ]; then
+            INSTANCE_DAEMON_PORT=44321
+        elif [ "$INSTANCE_FIRST_WDA_PORT" = "$WDA_PORT" ] \
+            && [ "$INSTANCE_FIRST_MJPEG_PORT" = "$MJPEG_PORT" ]; then
+            INSTANCE_DAEMON_PORT="$INSTANCE_FIRST_DAEMON_PORT"
+        else
+            _instance_derive_ports 1 || exit 1
+            INSTANCE_DAEMON_PORT="$INSTANCE_SLOT_DAEMON_PORT"
+        fi
+    fi
+    printf 'name=%s\n' "$INSTANCE_NAME"
+    printf 'state_dir=%s\n' "$STATE_DIR"
+    printf 'daemon_label=%s\n' "$DAEMON_LABEL"
+    printf 'wda_label=%s\n' "$WDA_AGENT_LABEL"
+    printf 'daemon_plist=%s\n' "$DAEMON_PLIST"
+    printf 'wda_plist=%s\n' "$WDA_AGENT_PLIST"
+    printf 'wda_dir=%s\n' "$WDA_DIR"
+    printf 'daemon_port=%s\n' "$INSTANCE_DAEMON_PORT"
+    printf 'wda_port=%s\n' "$WDA_PORT"
+    printf 'mjpeg_port=%s\n' "$MJPEG_PORT"
+    printf 'udid=%s\n' "$WDA_UDID"
+    printf 'first_slot_ports=%s %s %s\n' "$INSTANCE_FIRST_DAEMON_PORT" \
+        "$INSTANCE_FIRST_WDA_PORT" "$INSTANCE_FIRST_MJPEG_PORT"
+    _instance_check_bindings "$INSTANCE_DAEMON_PORT" "$WDA_PORT" "$MJPEG_PORT" || exit 1
+    exit 0
+fi
 
 BOLD=$'\033[1m'; RED=$'\033[0;31m'; GRN=$'\033[0;32m'; YLW=$'\033[1;33m'; RST=$'\033[0m'
 # Each stage header carries the seconds since this run started, so a slow
@@ -985,9 +1277,16 @@ _install_wda_supervisor() {
     for key in \
         WDA_KEEPALIVE PATH WDA_UDID WDA_TEAM_ID WDA_BUNDLE_ID \
         WDA_DIR WDA_REF WDA_RUNNER_ICON WDA_PORT MJPEG_PORT WDA_ALLOW_LAN \
-        WDA_ASC_KEY_PATH WDA_ASC_KEY_ID WDA_ASC_ISSUER_ID
+        WDA_ASC_KEY_PATH WDA_ASC_KEY_ID WDA_ASC_ISSUER_ID \
+        PHONE_REMOTE_INSTANCE PHONE_REMOTE_STATE_DIR
     do
         case "$key" in
+            # The default instance's supervisor stays byte-for-byte what it was.
+            PHONE_REMOTE_INSTANCE)
+                [ "${INSTANCE_NAME:-default}" != default ] || continue
+                value="$INSTANCE_NAME"
+                ;;
+            PHONE_REMOTE_STATE_DIR) value="${PHONE_REMOTE_STATE_DIR:-}" ;;
             WDA_KEEPALIVE) value="1" ;;
             PATH) value="/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin" ;;
             WDA_UDID) value="$WDA_UDID" ;;
@@ -2514,7 +2813,7 @@ case "$COMMAND" in
     status) cmd_status; exit $? ;;
     doctor) cmd_doctor; exit $? ;;
     setup)  ;;
-    *) die "unknown command: $1 (use: setup|status|stop|pause|resume|doctor)" ;;
+    *) die "unknown command: $1 (use: setup|status|stop|pause|resume|doctor|instance-context)" ;;
 esac
 
 if [ "${WDA_KEEPALIVE:-0}" = "1" ]; then
@@ -2627,6 +2926,11 @@ if [ -n "${WDA_UDID:-}" ] \
     && ! printf '%s' "$WDA_UDID" | LC_ALL=C grep -Eq '^[0-9A-Fa-f-]+$'; then
     die "target UDID contains invalid characters (expected hex and dashes)"
 fi
+# A second instance exists to drive one specific phone; guessing could hand it
+# the phone another daemon is driving.
+if [ "$INSTANCE_NAME" != default ] && [ -z "${WDA_UDID:-}" ]; then
+    die "instance $INSTANCE_NAME has no target iPhone; set WDA_UDID or rerun install.sh --instance $INSTANCE_NAME --udid <UDID>"
+fi
 # Prefer the iPhone physically on USB — with several paired phones, auto-detect
 # otherwise grabs the first -showdestinations hit, which is often a dead one.
 if [ -z "${WDA_UDID:-}" ]; then
@@ -2651,6 +2955,8 @@ if [ "$WDA_ALLOW_LAN" = "0" ]; then
 elif [ -z "${WDA_UDID:-}" ]; then
     warn "WDA_ALLOW_LAN=1: no USB target; paired destinations will be enumerated after the pinned checkout"
 fi
+_instance_check_bindings "$WDA_PORT" "$MJPEG_PORT" 2>&1 \
+    || die "refusing to set up instance $INSTANCE_NAME (see above)"
 _setstatus prereq "" "prerequisites passed"
 
 # ── 2. Clone / update WDA ─────────────────────────────────────────────────────

@@ -439,6 +439,30 @@ suggests saving the sequence, and a failed `phone_flow_run` keeps the failure so
 
 ## Operations
 
+### A second phone (named instances)
+
+One daemon drives one phone. To drive another iPhone at the same time, install a
+named instance for it; the default install is left exactly as it is:
+
+```bash
+./install.sh --instance lab --udid <UDID>      # UDID from: xcrun devicectl list devices
+PHONE_REMOTE_INSTANCE=lab ~/.iphone-use/instances/lab/setup-wda.sh
+```
+
+The instance gets its own copy of the app, state directory
+(`~/.iphone-use/instances/lab`, including its own WebDriverAgent checkout and so its own
+DerivedData), launchd labels (`com.leeguoo.iphone-use.lab`,
+`com.leeguoo.iphone-use.wda.lab`), loopback-only daemon, agent token and ports. Ports
+are derived from the name and persisted. The installer prints them, and
+`PHONE_REMOTE_INSTANCE=lab setup-wda.sh instance-context` shows them later. Signing
+(team, bundle ID, App Store Connect key) is inherited from the default instance's WDA
+supervisor unless set explicitly. A phone that another instance already drives, or a port
+another instance owns, is refused before anything changes. Agents target the instance
+with `PHONE_REMOTE_URL=http://127.0.0.1:<port>` and that instance's
+`PHONE_REMOTE_AGENT_TOKEN` (in `~/Library/LaunchAgents/com.leeguoo.iphone-use.lab.plist`).
+Remove only that instance with `uninstall.sh --instance lab`. The default uninstall
+refuses while named instances remain.
+
 ### Lifecycle and recovery
 
 `/agent/status` is the source of truth. `recovery_owner` is `daemon` for managed

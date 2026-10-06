@@ -180,6 +180,7 @@ jobs:
           python3 scripts/test-setup-wda-runner-cache.py
           python3 scripts/test-setup-wda-xcode-compat.py
           python3 scripts/test-auto-update.py
+          python3 scripts/test-instance-context.py
           # The nightly re-verification canary decides whether an installed
           # flow still works. Its verdict logic and its record-keeping are
           # tested here unconditionally — a conditional "run if present" would

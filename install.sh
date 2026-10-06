@@ -7,6 +7,13 @@
 # Local / dev usage (skip download; supply a pre-built .app):
 #   ./install.sh /path/to/iPhoneUse.app
 #
+# A second phone, driven by its own daemon (#67):
+#   ./install.sh --instance NAME --udid <UDID> [--port N] [/path/to/iPhoneUse.app]
+#   curl -fsSL .../install.sh | sh -s -- --instance NAME --udid <UDID>
+# A named instance gets its own copy of the app, state dir
+# (~/.iphone-use/instances/NAME), launchd labels, token and ports. It never
+# touches the default instance or the shared app; then run its setup-wda.sh.
+#
 # Requirements:
 #   • Must run as the LOGGED-IN GUI user (not root, not over a bare SSH session).
 #   • Aqua (WindowServer) session must be active.
@@ -55,6 +62,38 @@ LOG_DIR="$HOME/Library/Logs/iPhoneUse"
 REPO="leeguooooo/iphone-use"
 BINARY_INSIDE_APP="Contents/MacOS/iphone-use"
 MCP_BINARY_INSIDE_APP="Contents/MacOS/iphone-use-mcp"
+
+# --instance/--udid/--port select a named instance; anything else is the
+# optional local app path, as before.
+INSTANCE_NAME="default"
+INSTANCE_UDID=""
+INSTANCE_PORT=""
+INSTALL_ARGS=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --instance|--udid|--port)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                printf 'ERROR: %s requires a value\n' "$1" >&2
+                exit 2
+            fi
+            case "$1" in
+                --instance) INSTANCE_NAME="$2" ;;
+                --udid) INSTANCE_UDID="$2" ;;
+                --port) INSTANCE_PORT="$2" ;;
+            esac
+            shift 2
+            ;;
+        *)
+            INSTALL_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- ${INSTALL_ARGS[@]+"${INSTALL_ARGS[@]}"}
+if [ "$INSTANCE_NAME" = default ] && { [ -n "$INSTANCE_UDID" ] || [ -n "$INSTANCE_PORT" ]; }; then
+    printf 'ERROR: --udid/--port are accepted only with --instance NAME\n' >&2
+    exit 2
+fi
 
 # A piped script has no trustworthy sibling directory. In particular, `$0`
 # commonly names the shell, so deriving `./scripts/...` from it would allow the
@@ -1682,7 +1721,8 @@ bootstrap_pinned_installer() {
         IPHONE_USE_SKIP_SKILL=1 \
         IPHONE_USE_SKILL_VERIFIED_BY_BOOTSTRAP="$SKILL_SYNCED" \
         IPHONE_USE_SKILL_SHA256="$SKILL_SYNC_SHA256" \
-        /bin/bash "$helper_dir/install.sh" "$asset_dir/$APP_NAME"; then
+        /bin/bash "$helper_dir/install.sh" "$asset_dir/$APP_NAME" \
+        ${INSTANCE_FORWARD_ARGS[@]+"${INSTANCE_FORWARD_ARGS[@]}"}; then
         inner_status=0
     else
         inner_status=$?
@@ -1756,10 +1796,264 @@ fi
 # release tag, verifies the app asset's published SHA-256, then invokes the
 # downloaded installer as a real local file. It never inspects sibling files in
 # the caller's current working directory.
+INSTANCE_FORWARD_ARGS=()
+if [ "$INSTANCE_NAME" != default ]; then
+    INSTANCE_FORWARD_ARGS=(--instance "$INSTANCE_NAME")
+    [ -z "$INSTANCE_UDID" ] || INSTANCE_FORWARD_ARGS+=(--udid "$INSTANCE_UDID")
+    [ -z "$INSTANCE_PORT" ] || INSTANCE_FORWARD_ARGS+=(--port "$INSTANCE_PORT")
+fi
 if [ "$SCRIPT_IS_LOCAL" = "0" ]; then
     [ "${IPHONE_USE_INSTALLER_PINNED:-0}" != "1" ] \
         || die "Pinned inner installer must be executed from the downloaded local file."
     bootstrap_pinned_installer "$@"
+fi
+
+# ── Named instance (#67) ──────────────────────────────────────────────────────
+# A second phone gets a second daemon. Everything below writes only that
+# instance's plist, its private app copy and its state directory; the default
+# instance's app, plists and runtime are read (signing policy) but never
+# changed. Paths, labels and ports come from setup-wda.sh `instance-context`,
+# the one shell implementation of the derivation.
+named_plist_env() {
+    [ -f "$1" ] || { printf ''; return; }
+    /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$2" "$1" 2>/dev/null || printf ''
+}
+
+install_named_instance() {
+    local app_src="${1:-$INSTALL_DIR/$APP_NAME}"
+    local setup_src="$SCRIPT_DIR/scripts/setup-wda.sh"
+    local uninstall_src="$SCRIPT_DIR/uninstall.sh"
+    local default_wda_plist="$WDA_PLIST_DST"
+    local ctx state_dir label plist wda_label daemon_port wda_port mjpeg_port udid
+    local runtime app_dst app_stage app_backup="" plist_stage plist_backup=""
+    local binary token key value probe code i was_loaded=0
+    local -a env_keys env_values
+
+    [ "$SCRIPT_IS_LOCAL" = "1" ] \
+        || die "Named instances install from a local or release-pinned installer."
+    [ -f "$setup_src" ] && [ -f "$uninstall_src" ] \
+        || die "setup-wda.sh/uninstall.sh are missing next to this installer."
+    [ "$#" -le 1 ] || die "Only one app path may be given."
+
+    # Resolve and check the instance before touching anything: an invalid
+    # name, a port another instance owns, or a phone another daemon drives
+    # all fail here.
+    if ! ctx="$(env PHONE_REMOTE_INSTANCE="$INSTANCE_NAME" \
+        ${INSTANCE_UDID:+WDA_UDID="$INSTANCE_UDID"} \
+        ${INSTANCE_PORT:+PHONE_REMOTE_PORT="$INSTANCE_PORT"} \
+        /bin/bash "$setup_src" instance-context 2>&1)"; then
+        die "Instance $INSTANCE_NAME cannot be installed: $(printf '%s' "$ctx" | tail -1)"
+    fi
+    ctx_get() { printf '%s\n' "$ctx" | sed -n "s/^$1=//p" | head -1; }
+    state_dir="$(ctx_get state_dir)"
+    label="$(ctx_get daemon_label)"
+    wda_label="$(ctx_get wda_label)"
+    plist="$(ctx_get daemon_plist)"
+    daemon_port="$(ctx_get daemon_port)"
+    wda_port="$(ctx_get wda_port)"
+    mjpeg_port="$(ctx_get mjpeg_port)"
+    udid="$(ctx_get udid)"
+    [ "$(ctx_get name)" = "$INSTANCE_NAME" ] && [ -n "$state_dir" ] && [ -n "$label" ] \
+        && [ "$label" != "$PLIST_LABEL" ] \
+        || die "setup-wda.sh resolved an unexpected instance context."
+    [ -n "$udid" ] \
+        || die "A new instance needs its iPhone: --udid <UDID> (see: xcrun devicectl list devices)."
+    printf '%s' "$udid" | LC_ALL=C grep -Eq '^[0-9A-Fa-f-]+$' \
+        || die "--udid must be hex digits and dashes."
+    for value in "$daemon_port" "$wda_port" "$mjpeg_port"; do
+        printf '%s' "$value" | grep -Eq '^[0-9]{1,5}$' && [ "$value" -ge 1 ] && [ "$value" -le 65535 ] \
+            || die "Instance ports must be TCP ports (got '$value')."
+    done
+    [ "$daemon_port" != "$wda_port" ] && [ "$daemon_port" != "$mjpeg_port" ] \
+        && [ "$wda_port" != "$mjpeg_port" ] \
+        || die "Daemon, WDA and video ports must differ."
+
+    runtime="$state_dir/runtime"
+    app_dst="$runtime/$APP_NAME"
+    binary="$app_dst/$BINARY_INSIDE_APP"
+    if [ -f "$plist" ]; then
+        [ ! -L "$plist" ] || die "Refusing symlinked plist: $plist"
+        [ "$(/usr/libexec/PlistBuddy -c 'Print :Label' "$plist" 2>/dev/null)" = "$label" ] \
+            && [ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist" 2>/dev/null)" = "$binary" ] \
+            || die "$plist exists but is not this installer's instance $INSTANCE_NAME; refusing to overwrite it."
+    fi
+
+    # The app: a verified copy, private to the instance, so the default
+    # instance's upgrades never swap the binary under this daemon.
+    [ -d "$app_src" ] && [ ! -L "$app_src" ] || die "App not found: $app_src (install the default instance first, or pass an app path)."
+    [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_src/Contents/Info.plist" 2>/dev/null)" = "$BUNDLE_ID" ] \
+        || die "$app_src is not $BUNDLE_ID."
+    codesign --verify "$app_src" 2>/dev/null || die "$app_src fails signature verification."
+    probe="$(env PHONE_REMOTE_INSTANCE="$INSTANCE_NAME" "$app_src/$BINARY_INSIDE_APP" instance-context 2>/dev/null || true)"
+    printf '%s' "$probe" | grep -q "\"name\": *\"$INSTANCE_NAME\"" \
+        || die "$app_src predates named instances (no instance-context); install a newer release."
+
+    # Settings: explicit environment > this instance's plist > the default
+    # instance's WDA supervisor, which holds the signing policy that works on
+    # this Mac. The three ASC keys travel as a set.
+    env_keys=(); env_values=()
+    add_env() { [ -z "$2" ] || { env_keys+=("$1"); env_values+=("$2"); }; }
+    pick() {
+        local v
+        v="$(printenv "$1" 2>/dev/null || true)"
+        [ -n "$v" ] || v="$(named_plist_env "$plist" "$1")"
+        [ -n "$v" ] || [ "${2:-}" != inherit ] || v="$(named_plist_env "$default_wda_plist" "$1")"
+        printf '%s' "$v"
+    }
+    token="$(pick PHONE_REMOTE_AGENT_TOKEN)"
+    [ -n "$token" ] || token="$(openssl rand -hex 32)" || die "Could not generate an agent token."
+    add_env PHONE_REMOTE_INSTANCE "$INSTANCE_NAME"
+    # The daemon keeps its pid record and session secret under $TMPDIR; daemons
+    # up to v0.10.12 used one directory per user, so a second daemon saw the
+    # first one's pid and refused to start. A private TMPDIR keeps them apart
+    # on any release.
+    add_env TMPDIR "$state_dir/tmp"
+    add_env PHONE_REMOTE_HOST "$(pick PHONE_REMOTE_HOST)"
+    [ -n "$(pick PHONE_REMOTE_HOST)" ] || add_env PHONE_REMOTE_HOST 127.0.0.1
+    add_env PHONE_REMOTE_PORT "$daemon_port"
+    add_env PHONE_REMOTE_AGENT_TOKEN "$token"
+    add_env PHONE_REMOTE_BACKEND direct
+    add_env PHONE_REMOTE_UDID "$udid"
+    add_env PHONE_REMOTE_WDA_MANAGED true
+    add_env PHONE_REMOTE_WDA_URL "http://127.0.0.1:$wda_port"
+    add_env PHONE_REMOTE_WDA_MJPEG_URL "http://127.0.0.1:$mjpeg_port"
+    add_env WDA_PORT "$wda_port"
+    add_env MJPEG_PORT "$mjpeg_port"
+    add_env RUST_LOG "$(pick RUST_LOG)"
+    [ -n "$(pick RUST_LOG)" ] || add_env RUST_LOG warn
+    for key in PHONE_REMOTE_IDLE_RELEASE_SECS PHONE_REMOTE_PASSWORD PHONE_REMOTE_NO_UPDATE_CHECK; do
+        add_env "$key" "$(pick "$key")"
+    done
+    for key in WDA_TEAM_ID WDA_BUNDLE_ID WDA_REF WDA_ALLOW_LAN WDA_RUNNER_NAME WDA_RUNNER_ICON; do
+        add_env "$key" "$(pick "$key" inherit)"
+    done
+    if [ -n "${WDA_ASC_KEY_PATH:-}${WDA_ASC_KEY_ID:-}${WDA_ASC_ISSUER_ID:-}" ]; then
+        [ -n "${WDA_ASC_KEY_PATH:-}" ] && [ -n "${WDA_ASC_KEY_ID:-}" ] && [ -n "${WDA_ASC_ISSUER_ID:-}" ] \
+            || die "Set all three of WDA_ASC_KEY_PATH, WDA_ASC_KEY_ID and WDA_ASC_ISSUER_ID, or none."
+        add_env WDA_ASC_KEY_PATH "$WDA_ASC_KEY_PATH"
+        add_env WDA_ASC_KEY_ID "$WDA_ASC_KEY_ID"
+        add_env WDA_ASC_ISSUER_ID "$WDA_ASC_ISSUER_ID"
+    else
+        for value in "$plist" "$default_wda_plist"; do
+            if [ -n "$(named_plist_env "$value" WDA_ASC_KEY_PATH)" ] \
+                && [ -n "$(named_plist_env "$value" WDA_ASC_KEY_ID)" ] \
+                && [ -n "$(named_plist_env "$value" WDA_ASC_ISSUER_ID)" ]; then
+                for key in WDA_ASC_KEY_PATH WDA_ASC_KEY_ID WDA_ASC_ISSUER_ID; do
+                    add_env "$key" "$(named_plist_env "$value" "$key")"
+                done
+                break
+            fi
+        done
+    fi
+
+    info "Installing instance $INSTANCE_NAME for iPhone $udid"
+    for value in "$HOME/.iphone-use" "$HOME/.iphone-use/instances" "$state_dir" "$runtime" "$state_dir/logs" "$state_dir/tmp"; do
+        [ ! -L "$value" ] || die "Refusing symlinked instance namespace: $value"
+        if [ ! -d "$value" ]; then
+            mkdir -m 700 "$value" || die "Could not create $value"
+        fi
+    done
+
+    # Stage everything, then stop this instance's daemon (only it) and swap.
+    app_stage="$runtime/.$APP_NAME.new.$$"
+    rm -rf "$app_stage"
+    ditto "$app_src" "$app_stage" || die "Could not copy $app_src"
+    codesign --verify "$app_stage" 2>/dev/null || { rm -rf "$app_stage"; die "The copied app fails signature verification."; }
+    plist_stage="$(mktemp "$HOME/Library/LaunchAgents/.${label}.new.XXXXXX")"
+    /usr/bin/plutil -create xml1 "$plist_stage" \
+        && /usr/bin/plutil -insert Label -string "$label" "$plist_stage" \
+        && /usr/bin/plutil -insert ProgramArguments -array "$plist_stage" \
+        && /usr/bin/plutil -insert ProgramArguments.0 -string "$binary" "$plist_stage" \
+        && /usr/bin/plutil -insert ProgramArguments.1 -string serve "$plist_stage" \
+        && /usr/bin/plutil -insert RunAtLoad -bool true "$plist_stage" \
+        && /usr/bin/plutil -insert KeepAlive -bool true "$plist_stage" \
+        && /usr/bin/plutil -insert ThrottleInterval -integer 10 "$plist_stage" \
+        && /usr/bin/plutil -insert StandardOutPath -string "$state_dir/logs/iphone-use.log" "$plist_stage" \
+        && /usr/bin/plutil -insert StandardErrorPath -string "$state_dir/logs/iphone-use.err" "$plist_stage" \
+        && /usr/bin/plutil -insert ProcessType -string Interactive "$plist_stage" \
+        && /usr/bin/plutil -insert LimitLoadToSessionType -string Aqua "$plist_stage" \
+        && /usr/bin/plutil -insert EnvironmentVariables -dictionary "$plist_stage" \
+        || { rm -rf "$app_stage" "$plist_stage"; die "Could not build the instance plist."; }
+    i=0
+    while [ "$i" -lt "${#env_keys[@]}" ]; do
+        /usr/bin/plutil -insert "EnvironmentVariables.${env_keys[$i]}" -string "${env_values[$i]}" "$plist_stage" \
+            || { rm -rf "$app_stage" "$plist_stage"; die "Could not write ${env_keys[$i]} into the instance plist."; }
+        i=$((i + 1))
+    done
+    chmod 600 "$plist_stage"
+    /usr/bin/plutil -lint "$plist_stage" >/dev/null \
+        || { rm -rf "$app_stage" "$plist_stage"; die "Generated instance plist is invalid."; }
+
+    if launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then
+        was_loaded=1
+        launchctl bootout "gui/$UID_NUM/$label" 2>/dev/null || true
+        i=0
+        while launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1 && [ "$i" -lt 50 ]; do
+            sleep 0.2; i=$((i + 1))
+        done
+    fi
+    if [ -d "$app_dst" ]; then
+        app_backup="$runtime/.$APP_NAME.backup.$$"
+        mv "$app_dst" "$app_backup" || die "Could not move the previous instance app aside."
+    fi
+    mv "$app_stage" "$app_dst" || die "Could not install the instance app."
+    if [ -f "$plist" ]; then
+        plist_backup="$plist_stage.backup"
+        cp -p "$plist" "$plist_backup"
+    fi
+    mv -f "$plist_stage" "$plist"
+    for value in setup-wda.sh uninstall.sh; do
+        if [ "$value" = setup-wda.sh ]; then key="$setup_src"; else key="$uninstall_src"; fi
+        cp -f "$key" "$state_dir/$value.new.$$" && chmod 700 "$state_dir/$value.new.$$" \
+            && mv -f "$state_dir/$value.new.$$" "$state_dir/$value" \
+            || die "Could not install $state_dir/$value"
+    done
+
+    named_rollback() {
+        warn "Rolling back instance $INSTANCE_NAME: $1"
+        launchctl bootout "gui/$UID_NUM/$label" 2>/dev/null || true
+        if [ -n "$plist_backup" ]; then mv -f "$plist_backup" "$plist"; else rm -f "$plist"; fi
+        if [ -n "$app_backup" ]; then rm -rf "$app_dst"; mv "$app_backup" "$app_dst"; fi
+        if [ "$was_loaded" = 1 ] && [ -f "$plist" ]; then
+            launchctl bootstrap "gui/$UID_NUM" "$plist" 2>/dev/null || true
+        fi
+        die "$1"
+    }
+    launchctl enable "gui/$UID_NUM/$label" 2>/dev/null || true
+    launchctl bootstrap "gui/$UID_NUM" "$plist" 2>/dev/null \
+        || named_rollback "launchctl refused $plist"
+    code=000
+    i=0
+    while [ "$i" -lt 40 ]; do
+        code="$(curl -s -m 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$daemon_port/agent/status" 2>/dev/null || true)"
+        case "$code" in 000|'') ;; *) break ;; esac
+        sleep 0.5; i=$((i + 1))
+    done
+    case "$code" in
+        000|'') named_rollback "the instance daemon did not answer on 127.0.0.1:$daemon_port (see $state_dir/logs/iphone-use.err)" ;;
+    esac
+    [ -z "$app_backup" ] || rm -rf "$app_backup"
+    [ -z "$plist_backup" ] || rm -f "$plist_backup"
+
+    ok "Instance $INSTANCE_NAME daemon is up on http://127.0.0.1:$daemon_port"
+    echo ""
+    info "iPhone      : $udid"
+    info "Daemon      : http://127.0.0.1:$daemon_port   (launchd $label)"
+    info "WDA relays  : 127.0.0.1:$wda_port control, 127.0.0.1:$mjpeg_port video (launchd $wda_label)"
+    info "Token       : EnvironmentVariables:PHONE_REMOTE_AGENT_TOKEN in $plist"
+    info "State       : $state_dir"
+    echo ""
+    printf '  Agents target this phone with:\n'
+    printf "    ${BOLD}PHONE_REMOTE_URL=http://127.0.0.1:%s PHONE_REMOTE_AGENT_TOKEN=<token>${RESET}\n" "$daemon_port"
+    printf '  Next, build and start WebDriverAgent for this phone (keep it unlocked):\n'
+    printf "    ${BOLD}PHONE_REMOTE_INSTANCE=%s %s/setup-wda.sh${RESET}\n" "$INSTANCE_NAME" "$state_dir"
+    printf '  Remove only this instance with:\n'
+    printf "    ${BOLD}%s/uninstall.sh --instance %s${RESET}\n" "$state_dir" "$INSTANCE_NAME"
+    exit 0
+}
+
+if [ "$INSTANCE_NAME" != default ]; then
+    install_named_instance "$@"
 fi
 
 if [ "${IPHONE_USE_INTERNAL_TEST_RESOLVE_COMMIT_ONLY:-0}" = "1" ]; then
@@ -2351,6 +2645,28 @@ for ENV_KEY in \
 do
     append_plist_env "$ENV_KEY" "$(wda_env_or_existing "$ENV_KEY")"
 done
+# App Store Connect API-key signing only works with all three keys, and a
+# partial set must never mix with a different saved key: carry them as one
+# set from the first source that has all three (#67: an upgrade dropped them).
+ASC_SET_SOURCE=""
+if [ -n "${WDA_ASC_KEY_PATH:-}${WDA_ASC_KEY_ID:-}${WDA_ASC_ISSUER_ID:-}" ]; then
+    [ -n "${WDA_ASC_KEY_PATH:-}" ] && [ -n "${WDA_ASC_KEY_ID:-}" ] && [ -n "${WDA_ASC_ISSUER_ID:-}" ] \
+        || die "Set all three of WDA_ASC_KEY_PATH, WDA_ASC_KEY_ID and WDA_ASC_ISSUER_ID, or none."
+    for ENV_KEY in WDA_ASC_KEY_PATH WDA_ASC_KEY_ID WDA_ASC_ISSUER_ID; do
+        append_plist_env "$ENV_KEY" "$(printenv "$ENV_KEY")"
+    done
+else
+    for ASC_SET_SOURCE in "$PLIST_DST" "$WDA_PLIST_DST"; do
+        if [ -n "$(plist_env_get_from "$ASC_SET_SOURCE" WDA_ASC_KEY_PATH)" ] \
+            && [ -n "$(plist_env_get_from "$ASC_SET_SOURCE" WDA_ASC_KEY_ID)" ] \
+            && [ -n "$(plist_env_get_from "$ASC_SET_SOURCE" WDA_ASC_ISSUER_ID)" ]; then
+            for ENV_KEY in WDA_ASC_KEY_PATH WDA_ASC_KEY_ID WDA_ASC_ISSUER_ID; do
+                append_plist_env "$ENV_KEY" "$(plist_env_get_from "$ASC_SET_SOURCE" "$ENV_KEY")"
+            done
+            break
+        fi
+    done
+fi
 
 # ── Step 7 — Write the LaunchAgent plist ─────────────────────────────────────
 mkdir -p "$HOME/Library/LaunchAgents"

@@ -17,7 +17,8 @@ use std::path::{Path, PathBuf};
 
 /// Return (and, if necessary, create) the per-user runtime directory.
 ///
-/// The path is `$TMPDIR/hermes-phone-remote-$UID`, falling back to
+/// The path is `$TMPDIR/hermes-phone-remote-$UID` (`-<instance>` appended for
+/// a named instance), falling back to
 /// `/tmp/hermes-phone-remote-$UID` when `$TMPDIR` is unset or empty.
 ///
 /// If the directory already exists its owner and mode are validated; an
@@ -28,9 +29,20 @@ pub fn runtime_dir() -> io::Result<PathBuf> {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/tmp".to_owned());
-    let dir = PathBuf::from(base).join(format!("hermes-phone-remote-{uid}"));
+    let dir = PathBuf::from(base).join(dir_name(uid, crate::instance::current()));
     ensure_dir(&dir)?;
     Ok(dir)
+}
+
+/// The pid record and session secret are per daemon: a named instance (#67)
+/// gets its own directory so the default daemon's live pid record does not
+/// read as "already running" to it.
+fn dir_name(uid: u32, instance: &crate::instance::Instance) -> String {
+    if instance.is_default() {
+        format!("hermes-phone-remote-{uid}")
+    } else {
+        format!("hermes-phone-remote-{uid}-{}", instance.name)
+    }
 }
 
 /// Create `dir/name` atomically with mode `0600`, writing `bytes`.
@@ -180,6 +192,14 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_named_instance_gets_its_own_runtime_dir() {
+        let default = crate::instance::Instance::derive("", "/Users/x", None).unwrap();
+        let lab = crate::instance::Instance::derive("lab", "/Users/x", None).unwrap();
+        assert_eq!(dir_name(501, &default), "hermes-phone-remote-501");
+        assert_eq!(dir_name(501, &lab), "hermes-phone-remote-501-lab");
+    }
 
     // Helper: create a fresh 0700 tempdir.
     fn tmp700() -> TempDir {

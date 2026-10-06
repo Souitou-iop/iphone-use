@@ -15,9 +15,10 @@ use std::sync::OnceLock;
 
 pub const DEFAULT_NAME: &str = "default";
 const DAEMON_LABEL: &str = "com.leeguoo.iphone-use";
-/// The one name that would make a named instance's daemon label collide with
-/// the default instance's WDA label.
-const RESERVED_NAMES: &[&str] = &["wda"];
+/// Names whose daemon label would collide with another product LaunchAgent:
+/// the default instance's WDA supervisor and the maintenance jobs that share
+/// the `com.leeguoo.iphone-use.` prefix.
+const RESERVED_NAMES: &[&str] = &["wda", "autoupdate", "daily-maintenance", "flow-reverify"];
 const NAME_MAX_LEN: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,6 +252,13 @@ mod tests {
             assert_eq!(instance.wda_label, case["wda_label"].as_str().unwrap(), "{name}: wda_label");
             assert_eq!(instance.wda_plist(), PathBuf::from(case["wda_plist"].as_str().unwrap()), "{name}: wda_plist");
         }
+        let reserved: Vec<&str> = golden["reserved_names"]
+            .as_array()
+            .expect("reserved_names")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(reserved, RESERVED_NAMES, "reserved names drifted from the fixture");
         for bad in golden["invalid_names"].as_array().expect("invalid_names") {
             let bad = bad.as_str().unwrap();
             assert!(Instance::derive(bad, "/Users/x", None).is_err(), "{bad:?} must be rejected");

@@ -9,6 +9,7 @@ set -u
 umask 077
 
 DRY_RUN=0
+INSTANCE_NAME="default"
 REMOVE_PHONE_RUNNER=0
 PHONE_UDID=""
 PHONE_BUNDLE_ID=""
@@ -17,10 +18,15 @@ FAILED=0
 usage() {
     cat <<'EOF'
 Usage:
-  ./uninstall.sh [--dry-run]
+  ./uninstall.sh [--instance NAME] [--dry-run]
   ./uninstall.sh --remove-phone-runner --udid <UDID> --bundle-id <bundle-id> [--dry-run]
 
 Options:
+  --instance NAME         Remove only this named instance (its daemon, WDA
+                          supervisor, relays, runtime app copy and state under
+                          ~/.iphone-use/instances/NAME). Without it, the
+                          default instance and the shared app are removed,
+                          which is refused while named instances remain.
   --dry-run               Show owned artifacts and actions without changing anything.
   --remove-phone-runner   Also uninstall one explicitly identified WDA runner app.
   --udid VALUE            Exact configured iPhone UDID for --remove-phone-runner.
@@ -36,6 +42,11 @@ while [ "$#" -gt 0 ]; do
         --dry-run)
             DRY_RUN=1
             shift
+            ;;
+        --instance)
+            [ "$#" -ge 2 ] || { printf 'ERROR: --instance requires a value\n' >&2; exit 2; }
+            INSTANCE_NAME="$2"
+            shift 2
             ;;
         --remove-phone-runner)
             REMOVE_PHONE_RUNNER=1
@@ -146,9 +157,43 @@ SHASUM_BIN="${IPHONE_USE_SHASUM:-$(command -v shasum 2>/dev/null || true)}"
 [ -x "$STAT_BIN" ] \
     || { printf 'ERROR: stat is unavailable: %s\n' "$STAT_BIN" >&2; exit 1; }
 
-DAEMON_LABEL="com.leeguoo.iphone-use"
-WDA_LABEL="com.leeguoo.iphone-use.wda"
+# Instance derivation mirrors scripts/setup-wda.sh and
+# crates/server/src/instance.rs (scripts/fixtures/instance-derivation.json).
+INSTANCE_LABEL_PREFIX="com.leeguoo.iphone-use"
+INSTANCE_RESERVED_NAMES="wda autoupdate daily-maintenance flow-reverify"
+instance_name_valid() {
+    local reserved
+    printf '%s' "$1" | LC_ALL=C grep -Eq '^[a-z][a-z0-9-]{0,31}$' || return 1
+    [ "$(printf '%s' "$1" | wc -l | tr -d ' ')" = "0" ] || return 1
+    for reserved in $INSTANCE_RESERVED_NAMES; do
+        [ "$1" != "$reserved" ] || return 1
+    done
+}
+if [ "$INSTANCE_NAME" != default ] && ! instance_name_valid "$INSTANCE_NAME"; then
+    printf 'ERROR: --instance %s is not a valid instance name: lowercase [a-z][a-z0-9-], at most 32 chars, not one of: %s\n' \
+        "$INSTANCE_NAME" "$INSTANCE_RESERVED_NAMES" >&2
+    exit 2
+fi
+
 LEGACY_LABEL="work.pwtk.iphone-remote"
+INSTANCES_DIR="$HOME/.iphone-use/instances"
+if [ "$INSTANCE_NAME" = default ]; then
+    DAEMON_LABEL="$INSTANCE_LABEL_PREFIX"
+    WDA_LABEL="$INSTANCE_LABEL_PREFIX.wda"
+    STATE_DIR="$HOME/.iphone-use"
+    APP_PARENT="$HOME/Applications"
+    LOG_DIR="$HOME/Library/Logs/iPhoneUse"
+    LOG_PARENT="$HOME/Library/Logs"
+else
+    # A named instance owns its own copy of the app and its logs, both inside
+    # its state directory; the shared app, CLI link and logs are untouched.
+    DAEMON_LABEL="$INSTANCE_LABEL_PREFIX.$INSTANCE_NAME"
+    WDA_LABEL="$INSTANCE_LABEL_PREFIX.wda.$INSTANCE_NAME"
+    STATE_DIR="$INSTANCES_DIR/$INSTANCE_NAME"
+    APP_PARENT="$STATE_DIR/runtime"
+    LOG_DIR="$STATE_DIR/logs"
+    LOG_PARENT="$STATE_DIR"
+fi
 
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 DAEMON_PLIST="$LAUNCH_AGENTS_DIR/$DAEMON_LABEL.plist"
@@ -156,14 +201,12 @@ WDA_PLIST="$LAUNCH_AGENTS_DIR/$WDA_LABEL.plist"
 LEGACY_PLIST="$LAUNCH_AGENTS_DIR/$LEGACY_LABEL.plist"
 LEGACY_DISABLED_PLIST="$LEGACY_PLIST.disabled"
 
-APP_PATH="$HOME/Applications/iPhoneUse.app"
+APP_PATH="$APP_PARENT/iPhoneUse.app"
 APP_BINARY="$APP_PATH/Contents/MacOS/iphone-use"
 LEGACY_APP_PATH="$HOME/Applications/iPhoneRemote.app"
 LEGACY_APP_BINARY="$LEGACY_APP_PATH/Contents/MacOS/iphone-remote"
 
-LOG_DIR="$HOME/Library/Logs/iPhoneUse"
 LEGACY_LOG_DIR="$HOME/Library/Logs/iPhoneRemote"
-STATE_DIR="$HOME/.iphone-use"
 FIXED_SETUP="$STATE_DIR/setup-wda.sh"
 WDA_CHECKOUT="$STATE_DIR/WebDriverAgent"
 WDA_CHECKOUT_MARKER="$STATE_DIR/wda-checkout-owner.v1"
@@ -251,7 +294,47 @@ namespace_dir_safe() {
 }
 
 namespace_dir_safe "$LAUNCH_AGENTS_DIR" owned || LAUNCH_AGENTS_SAFE=0
+if [ "$INSTANCE_NAME" != default ]; then
+    namespace_dir_safe "$HOME/.iphone-use" private || STATE_SAFE=0
+    namespace_dir_safe "$INSTANCES_DIR" private || STATE_SAFE=0
+fi
 namespace_dir_safe "$STATE_DIR" private || STATE_SAFE=0
+
+# Named instances whose plists are still installed, one per line.
+remaining_named_instances() {
+    local plist label name
+    for plist in "$LAUNCH_AGENTS_DIR/$INSTANCE_LABEL_PREFIX".*.plist; do
+        [ -f "$plist" ] || continue
+        label="$("$PLISTBUDDY_BIN" -c 'Print :Label' "$plist" 2>/dev/null || true)"
+        case "$label" in
+            "$INSTANCE_LABEL_PREFIX.wda") continue ;;
+            "$INSTANCE_LABEL_PREFIX.wda."*) name="${label#"$INSTANCE_LABEL_PREFIX.wda."}" ;;
+            "$INSTANCE_LABEL_PREFIX."*) name="${label#"$INSTANCE_LABEL_PREFIX."}" ;;
+            *) continue ;;
+        esac
+        case " $INSTANCE_RESERVED_NAMES " in
+            *" $name "*) continue ;;
+        esac
+        printf '%s\n' "$name"
+    done | sort -u
+}
+
+# The default instance's state directory holds every named instance's, and
+# the shared app is what their installs were copied from: removing it first
+# would orphan running daemons. Refuse before anything is touched.
+if [ "$INSTANCE_NAME" = default ]; then
+    REMAINING_INSTANCES="$(remaining_named_instances)"
+    if [ -n "$REMAINING_INSTANCES" ] \
+        || [ -n "$(find "$INSTANCES_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+        printf 'ERROR: named iphone-use instances are still installed; remove each first:\n' >&2
+        for name in $REMAINING_INSTANCES; do
+            printf '  ./uninstall.sh --instance %s\n' "$name" >&2
+        done
+        [ -z "$(find "$INSTANCES_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] \
+            || printf '  (state remains under %s)\n' "$INSTANCES_DIR" >&2
+        exit 1
+    fi
+fi
 
 assert_exact_path() {
     local actual="$1"
@@ -871,7 +954,7 @@ remove_owned_app() {
         fail "preserving app whose bundle/executable does not match iphone-use ownership: $path"
         return 1
     fi
-    remove_tree "$path" "$expected_path" "$HOME/Applications"
+    remove_tree "$path" "$expected_path" "$APP_PARENT"
 }
 
 sha256_text() {
@@ -1326,7 +1409,9 @@ info "1/5 stopping the iphone-use daemon"
 DAEMON_RUNTIME_CLEAN=1
 LEGACY_RUNTIME_CLEAN=1
 stop_owned_job daemon "$DAEMON_LABEL" "$DAEMON_PLIST" || DAEMON_RUNTIME_CLEAN=0
-stop_owned_job legacy "$LEGACY_LABEL" "$LEGACY_PLIST" || LEGACY_RUNTIME_CLEAN=0
+if [ "$INSTANCE_NAME" = default ]; then
+    stop_owned_job legacy "$LEGACY_LABEL" "$LEGACY_PLIST" || LEGACY_RUNTIME_CLEAN=0
+fi
 
 info "2/5 stopping the product-owned WDA supervisor and PID-verified processes"
 WDA_RUNTIME_CLEAN=1
@@ -1354,9 +1439,20 @@ if [ "$DAEMON_RUNTIME_CLEAN" = "1" ]; then
     DAEMON_ARTIFACTS_CLEAN=1
     remove_owned_app "$APP_PATH" "$APP_PATH" "$APP_BINARY" \
         "com.leeguoo.iphone-use" || DAEMON_ARTIFACTS_CLEAN=0
-    [ "$DAEMON_ARTIFACTS_CLEAN" = "0" ] || remove_cli_link || DAEMON_ARTIFACTS_CLEAN=0
-    remove_tree "$LOG_DIR" "$HOME/Library/Logs/iPhoneUse" \
-        "$HOME/Library/Logs" || DAEMON_ARTIFACTS_CLEAN=0
+    if [ "$INSTANCE_NAME" = default ]; then
+        [ "$DAEMON_ARTIFACTS_CLEAN" = "0" ] || remove_cli_link || DAEMON_ARTIFACTS_CLEAN=0
+    elif [ "$DAEMON_ARTIFACTS_CLEAN" = "1" ] && [ -d "$APP_PARENT" ] && [ ! -L "$APP_PARENT" ]; then
+        if [ "$DRY_RUN" = "1" ]; then
+            plan "remove empty directory $APP_PARENT"
+        else
+            rmdir "$APP_PARENT" 2>/dev/null || true
+        fi
+    fi
+    remove_tree "$LOG_DIR" "$LOG_DIR" "$LOG_PARENT" || DAEMON_ARTIFACTS_CLEAN=0
+    if [ "$INSTANCE_NAME" != default ]; then
+        # The daemon's private TMPDIR (pid record, session secret).
+        remove_tree "$STATE_DIR/tmp" "$STATE_DIR/tmp" "$STATE_DIR" || DAEMON_ARTIFACTS_CLEAN=0
+    fi
     if [ "$DAEMON_ARTIFACTS_CLEAN" = "1" ]; then
         remove_owned_plist daemon "$DAEMON_PLIST" || DAEMON_ARTIFACTS_CLEAN=0
     fi
@@ -1365,7 +1461,9 @@ if [ "$DAEMON_RUNTIME_CLEAN" = "1" ]; then
 else
     warn "preserved current daemon plist, app, and logs because its shutdown/ownership was not verified"
 fi
-if [ "$LEGACY_RUNTIME_CLEAN" = "1" ]; then
+if [ "$INSTANCE_NAME" != default ]; then
+    :
+elif [ "$LEGACY_RUNTIME_CLEAN" = "1" ]; then
     LEGACY_ARTIFACTS_CLEAN=1
     remove_owned_app "$LEGACY_APP_PATH" "$LEGACY_APP_PATH" "$LEGACY_APP_BINARY" \
         "work.pwtk.iphone-remote" || LEGACY_ARTIFACTS_CLEAN=0
@@ -1397,7 +1495,7 @@ elif [ "$STATE_SAFE" = "1" ] && [ "$WDA_CHECKOUT_PRESENT" = "1" ]; then
         # work. Re-run the full marker/Git proof immediately before rm -rf so a
         # checkout that became dirty or gained refs/worktrees is preserved.
         if wda_checkout_owned; then
-            remove_tree "$WDA_CHECKOUT" "$HOME/.iphone-use/WebDriverAgent" "$STATE_DIR"
+            remove_tree "$WDA_CHECKOUT" "$STATE_DIR/WebDriverAgent" "$STATE_DIR"
         else
             fail "preserving WDA checkout after final ownership recheck: ${WDA_CHECKOUT_REASON:-ownership changed}: $WDA_CHECKOUT"
             STATE_TREE_REMOVABLE=0
@@ -1425,7 +1523,7 @@ if [ "$FAILED" = "0" ] \
         wda-supervisor.rollback.plist \
         setup-wda.sh
     do
-        remove_file "$STATE_DIR/$state_name" "$HOME/.iphone-use/$state_name"
+        remove_file "$STATE_DIR/$state_name" "$STATE_DIR/$state_name"
         [ "$FAILED" = "0" ] || break
     done
     [ "$FAILED" != "0" ] || remove_state_transients
@@ -1458,11 +1556,14 @@ if [ "$FINALIZE_STATE" = "1" ]; then
             plan "remove file $STATE_DIR/uninstall.sh last (if installed)"
             plan "remove empty directory $STATE_DIR"
         else
-            remove_file "$STATE_DIR/uninstall.sh" "$HOME/.iphone-use/uninstall.sh"
+            remove_file "$STATE_DIR/uninstall.sh" "$STATE_DIR/uninstall.sh"
             if [ "$FAILED" = "0" ] \
                 && [ -z "$(find "$STATE_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
                 if rmdir "$STATE_DIR"; then
                     ok "removed empty $STATE_DIR"
+                    if [ "$INSTANCE_NAME" != default ]; then
+                        rmdir "$INSTANCES_DIR" 2>/dev/null || true
+                    fi
                 else
                     fail "could not remove empty state directory: $STATE_DIR"
                 fi

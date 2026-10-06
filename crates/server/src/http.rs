@@ -2933,6 +2933,10 @@ fn write_and_bootstrap_wda_agent(setup_sh: &str, log: &str, udid: &str) -> bool 
             "WDA_ASC_KEY_PATH",
             "WDA_ASC_KEY_ID",
             "WDA_ASC_ISSUER_ID",
+            // A named instance's supervisor must run its own setup copy as
+            // that instance (#67); unset for the default instance.
+            "PHONE_REMOTE_INSTANCE",
+            "PHONE_REMOTE_STATE_DIR",
         ] {
             if let Ok(value) = std::env::var(key) {
                 if !value.is_empty() {
