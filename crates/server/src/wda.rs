@@ -48,6 +48,14 @@ pub struct WdaClient {
     /// The last tree read and when: snapshot-bound actions reuse it instead
     /// of reading the whole tree again (see [`Self::recent_tree`]).
     last_tree: Option<(std::sync::Arc<Vec<ElementRow>>, std::time::Instant)>,
+    /// Whether the last [`Self::elements`] kept the tree read without
+    /// `isVisible` (see [`Self::bounded_source`]): its rows' `visible` is
+    /// geometric, and the next read keeps that mode until the tree shrinks
+    /// well below the limit.
+    lite_source: bool,
+    /// What the read path has learned about tree sizes; decides when a read
+    /// needs the size probe (see [`ProbeMemory::should_probe`]).
+    probe: ProbeMemory,
     /// The screen as it stood after the last action settled (PNG), kept in
     /// memory only so `/agent/screenshot` can answer without a new capture.
     /// Dropped by the next screen-changing POST.
@@ -97,6 +105,8 @@ impl WdaClient {
             posted_at: None,
             no_alert_at: None,
             last_tree: None,
+            lite_source: false,
+            probe: ProbeMemory::default(),
             settled_frame: None,
             settle_frames_paused_until: None,
             actionability_budget: ACTIONABILITY_PROBE_BUDGET,
@@ -355,9 +365,19 @@ impl WdaClient {
     /// Source reads are read-only, so avoiding session creation also removes a
     /// source/session churn loop during relay recovery.
     pub async fn source(&mut self) -> Result<serde_json::Value> {
+        self.source_excluding(None).await
+    }
+
+    /// [`Self::source`] with WDA's `excluded_attributes` (comma-separated
+    /// attribute names such as `visible`), which WDA then never computes.
+    async fn source_excluding(&mut self, excluded: Option<&str>) -> Result<serde_json::Value> {
+        let url = match excluded {
+            Some(names) => format!("{}/source?format=json&excluded_attributes={names}", self.base),
+            None => format!("{}/source?format=json", self.base),
+        };
         let body = self
             .http
-            .get(format!("{}/source?format=json", self.base))
+            .get(url)
             .send_timed()
             .await
             .context("GET /source")?
@@ -1293,9 +1313,12 @@ impl WdaClient {
     /// it's text — an order of magnitude cheaper, and it carries the labels
     /// needed for [`Self::find_element`]/[`Self::click_element`].
     pub async fn elements(&mut self) -> Result<Vec<ElementRow>> {
-        let tree = self.source().await?;
+        let (tree, lite) = self.bounded_source().await?;
         let mut rows = Vec::new();
         flatten_tree(&tree, 0, &mut rows);
+        if lite {
+            mark_rows_outside_root(&tree, &mut rows);
+        }
         // The Application node's frame IS the window in points: keep the
         // window-size cache fresh for free instead of a GET /window/size.
         // Read it from the raw root (an unlabeled root is not emitted as a row).
@@ -1315,6 +1338,84 @@ impl WdaClient {
         }
         self.last_tree = Some((std::sync::Arc::new(rows.clone()), std::time::Instant::now()));
         Ok(rows)
+    }
+
+    /// The tree for [`Self::elements`], never asking WDA for a read that can
+    /// outlive the runner. Returns the tree and whether it is the lite one.
+    ///
+    /// WDA's `isVisible` costs a hit-test per node. On a screen whose tree is
+    /// huge that is fatal: WeChat's chat list exposes every conversation
+    /// (hardware: 637 Cells, 3450 nodes), the full JSON read ran past 35 s,
+    /// and testmanagerd killed the runner — the "Mode B" of the agent
+    /// reference. The same screen without `visible` reads in ~5 s, and a
+    /// normal screen in ~0.3 s instead of ~1.5 s. So: read without
+    /// `visible` first; when that tree is small, read again with it, so
+    /// normal screens keep WDA's exact occlusion answer; when it is large,
+    /// keep the lite tree and judge visibility by geometry instead.
+    /// Probing every read (not once per app) matters: one app can hold both
+    /// kinds of screen, and backing out of a WeChat chat lands on the list.
+    async fn bounded_source(&mut self) -> Result<(serde_json::Value, bool)> {
+        if std::env::var("PHONE_REMOTE_SOURCE_PROBE").is_ok_and(|value| value.trim() == "0") {
+            return Ok((self.source().await?, false));
+        }
+        let limit = full_source_max_nodes();
+        let untouched = self
+            .probe
+            .small_tree_at
+            .is_some_and(|at| self.posted_at.is_none_or(|posted| posted < at));
+        // After an app switch, ask WDA which app is in front (~20 ms) rather
+        // than probe (~150 ms): a known-small app reads in full at once.
+        if self.probe.app_switched && !untouched && !self.lite_source {
+            // Bounded: a slow answer must not hold up the read it is meant
+            // to speed up; unknown simply means probe.
+            let bundles =
+                tokio::time::timeout(Duration::from_secs(1), self.active_bundles()).await;
+            self.probe.switched_bundle = match bundles {
+                Ok(Ok(bundles)) => bundles.into_iter().next(),
+                Ok(Err(error)) => {
+                    tracing::debug!("elements: frontmost app unknown, probing: {error:#}");
+                    None
+                }
+                Err(_) => {
+                    tracing::debug!("elements: frontmost app lookup timed out, probing");
+                    None
+                }
+            };
+        }
+        if !self.probe.should_probe(limit, untouched, self.lite_source) {
+            let full = self.source().await?;
+            self.probe.record(&full, limit);
+            if self.probe.last_nodes() > limit {
+                // Grew past the limit without a probe: it was read, but the
+                // app now always probes.
+                tracing::warn!("elements: {} nodes read in full without a probe", self.probe.last_nodes());
+            }
+            return Ok((full, false));
+        }
+        // The probe also skips `isAccessible` (Calculator: 70 ms vs 90 ms
+        // with it, full read 370 ms; WeChat's list 2.3 s vs 5.3 s). Rows of a
+        // tree kept lite carry no `accessible`; nothing decides on it.
+        let lite = self.source_excluding(Some(PROBE_EXCLUDED_ATTRIBUTES)).await?;
+        self.probe.record(&lite, limit);
+        let nodes = self.probe.last_nodes();
+        if keep_lite_source(nodes, limit, self.lite_source) {
+            tracing::info!("elements: {nodes} nodes, keeping the tree read without isVisible");
+            self.lite_source = true;
+            self.probe.small_tree_at = None;
+            return Ok((lite, true));
+        }
+        self.lite_source = false;
+        // A small tree whose full read still fails points at WDA itself, not
+        // at the tree: report it like any failed read rather than hide it
+        // behind the probe.
+        let full = self.source().await?;
+        Ok((full, false))
+    }
+
+    /// Whether the last [`Self::elements`] judged `visible` by geometry
+    /// rather than by WDA (a tree above the node limit).
+    pub fn visibility_is_geometric(&self) -> bool {
+        self.lite_source
     }
 
     /// The last tree read, if nothing has been POSTed to WDA since and it is
@@ -1376,6 +1477,15 @@ impl WdaClient {
             || path.ends_with("/elements")
             || path.ends_with("/element");
         if !read_only {
+            // A new app or the Home Screen is a screen of unknown size.
+            if path.ends_with("/wda/apps/launch")
+                || path.ends_with("/wda/apps/activate")
+                || path.ends_with("/wda/pressButton")
+                || path.ends_with("/wda/homescreen")
+                || path.ends_with("/url")
+            {
+                self.probe.app_switched = true;
+            }
             self.posted_at = Some(std::time::Instant::now());
             // Shows a screen that is about to change; free it now.
             self.settled_frame = None;
@@ -1562,6 +1672,167 @@ impl WdaClient {
             .context("POST wda/lock")?;
         ensure_wda_success(response, "POST wda/lock").await?;
         Ok(())
+    }
+}
+
+/// Node count above which [`WdaClient::bounded_source`] keeps the tree read
+/// without `isVisible`. 1000 is about a quarter of the WeChat list that
+/// killed the runner; `PHONE_REMOTE_SOURCE_MAX_NODES` overrides it.
+fn full_source_max_nodes() -> usize {
+    std::env::var("PHONE_REMOTE_SOURCE_MAX_NODES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1000)
+}
+
+/// WDA attributes the size probe does not compute: the two per-node
+/// accessibility queries that make a huge tree's read outlive the runner.
+const PROBE_EXCLUDED_ATTRIBUTES: &str = "visible,accessible";
+
+/// Reads per app that always probe before the app has shown its sizes: an
+/// app restored into a small screen (WeChat reopening into a chat) must not
+/// back out into its huge list on a full read before it was ever measured.
+const PROBE_WARMUP_READS: u32 = 6;
+
+/// What [`WdaClient::bounded_source`] has seen of tree sizes. The probe costs
+/// a second `/source` on every small screen (bench: tap label 0.9 s -> 1.15 s,
+/// Settings observed step 5.4 s -> 6.8 s), so it runs only when the next
+/// tree could plausibly be huge. Everything here lives for the daemon run:
+/// agents launch an app, read a few times and leave, so per-visit counts
+/// would never finish warming up.
+#[derive(Debug, Default)]
+struct ProbeMemory {
+    /// Something that changes app (launch, activate, Home, open URL) was
+    /// sent since the last read.
+    app_switched: bool,
+    /// After a switch: the frontmost bundle, when WDA could name it.
+    switched_bundle: Option<String>,
+    /// Root `Application` label of the last tree read.
+    current: Option<String>,
+    /// Per app label: sizes seen so far.
+    apps: std::collections::HashMap<String, AppSizes>,
+    /// Bundle id -> app label, learned on the first read after a switch, so
+    /// the next switch to a known-small app skips the probe.
+    bundle_labels: std::collections::HashMap<String, String>,
+    /// When a tree under the limit was last read; until something is POSTed
+    /// after it the screen cannot have become huge on its own.
+    small_tree_at: Option<std::time::Instant>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct AppSizes {
+    /// Reads of this app, ever (this daemon run).
+    reads: u32,
+    /// Nodes in its last tree.
+    last_nodes: usize,
+    /// It has shown a tree over the limit at least once.
+    heavy: bool,
+}
+
+impl ProbeMemory {
+    /// The app the next read lands in, as far as is known.
+    fn next_app(&self) -> Option<&str> {
+        if self.app_switched {
+            let bundle = self.switched_bundle.as_deref()?;
+            return self.bundle_labels.get(bundle).map(String::as_str);
+        }
+        self.current.as_deref()
+    }
+
+    /// `untouched`: nothing was POSTed since `small_tree_at`.
+    fn should_probe(&self, limit: usize, untouched: bool, lite: bool) -> bool {
+        if lite {
+            return true; // hysteresis decides when to leave lite
+        }
+        if untouched {
+            return false; // wait_for polls, settle re-reads
+        }
+        let Some(sizes) = self.next_app().and_then(|app| self.apps.get(app)) else {
+            return true; // an app never measured, or a switch to who knows where
+        };
+        sizes.heavy || sizes.last_nodes * 5 >= limit * 4 || sizes.reads < PROBE_WARMUP_READS
+    }
+
+    fn record(&mut self, tree: &serde_json::Value, limit: usize) {
+        let app = tree
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .filter(|label| !label.is_empty())
+            .or_else(|| tree.get("name").and_then(serde_json::Value::as_str))
+            .unwrap_or("")
+            .to_string();
+        let nodes = count_nodes(tree);
+        if let Some(bundle) = self.switched_bundle.take() {
+            self.bundle_labels.insert(bundle, app.clone());
+        }
+        let sizes = self.apps.entry(app.clone()).or_default();
+        sizes.reads = sizes.reads.saturating_add(1);
+        sizes.last_nodes = nodes;
+        if nodes > limit {
+            sizes.heavy = true;
+            self.small_tree_at = None;
+        } else {
+            self.small_tree_at = Some(std::time::Instant::now());
+        }
+        self.app_switched = false;
+        self.current = Some(app);
+    }
+
+    fn last_nodes(&self) -> usize {
+        self.current
+            .as_deref()
+            .and_then(|app| self.apps.get(app))
+            .map_or(0, |sizes| sizes.last_nodes)
+    }
+}
+
+/// Read mode with hysteresis: a tree above `limit` keeps the lite read, and
+/// once lite it stays lite until the tree drops below 80% of `limit`. Settle
+/// and `wait_for` compare snapshot ids, which hash `visible`; a screen near
+/// the limit must not alternate between WDA's and the geometric answer, or
+/// two reads of an unchanged screen would never match. The band is below
+/// the limit only: going above it would send a full read to a bigger tree.
+fn keep_lite_source(nodes: usize, limit: usize, was_lite: bool) -> bool {
+    nodes > limit || (was_lite && nodes * 5 >= limit * 4)
+}
+
+fn count_nodes(node: &serde_json::Value) -> usize {
+    1 + node
+        .get("children")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |children| children.iter().map(count_nodes).sum())
+}
+
+/// Geometric stand-in for WDA's `isVisible` on a lite tree: a row lying
+/// wholly outside the root's frame (a list cell scrolled away) or with no
+/// area is `visible:false`; everything else stays unknown (`None`), as WDA's
+/// own answer would have been omitted for a visible row.
+fn mark_rows_outside_root(tree: &serde_json::Value, rows: &mut [ElementRow]) {
+    let field = |name: &str| {
+        tree.get("rect")
+            .and_then(|rect| rect.get(name))
+            .and_then(serde_json::Value::as_f64)
+    };
+    let (Some(rx), Some(ry), Some(rw), Some(rh)) =
+        (field("x"), field("y"), field("width"), field("height"))
+    else {
+        return;
+    };
+    if rw <= 0.0 || rh <= 0.0 {
+        return;
+    }
+    for row in rows.iter_mut() {
+        let [x, y, w, h] = row.rect;
+        let outside = w <= 0.0
+            || h <= 0.0
+            || x + w <= rx
+            || y + h <= ry
+            || x >= rx + rw
+            || y >= ry + rh;
+        if outside {
+            row.visible = Some(false);
+        }
     }
 }
 
@@ -2371,8 +2642,9 @@ mod tests {
 
     #[test]
     fn a_tree_read_refreshes_the_window_size_without_asking_wda() {
-        // One request only: the source. A GET /window/size would hang the test.
-        let (base, server) = mock_wda(1, |request| {
+        // Only the two source reads (probe + full). A GET /window/size would
+        // hang the test.
+        let (base, server) = mock_wda(2, |request| {
             assert!(request.contains("/source"), "unexpected: {request}");
             r#"{"value":{"type":"XCUIElementTypeApplication","rect":{"x":0,"y":0,"width":440,"height":956},"children":[]}}"#.to_string()
         });
@@ -2383,6 +2655,223 @@ mod tests {
             assert_eq!(client.window_size().await.unwrap(), (440.0, 956.0));
         });
         server.join().unwrap();
+    }
+
+    fn tree_with_cells(cells: usize, off_screen_label: &str) -> String {
+        let mut children: Vec<serde_json::Value> = (0..cells)
+            .map(|index| {
+                serde_json::json!({"type":"XCUIElementTypeCell","label":format!("chat {index}"),
+                    "rect":{"x":0,"y":100,"width":440,"height":60}})
+            })
+            .collect();
+        children.push(serde_json::json!({"type":"XCUIElementTypeCell","label":off_screen_label,
+            "rect":{"x":0,"y":38_000,"width":440,"height":60}}));
+        serde_json::json!({"value":{"type":"XCUIElementTypeApplication","label":"WeChat",
+            "rect":{"x":0,"y":0,"width":440,"height":956},"children":children}})
+        .to_string()
+    }
+
+    #[test]
+    fn a_small_tree_is_read_again_with_visibility() {
+        let (base, server) = mock_wda(2, |request| {
+            if request.starts_with("GET /source?format=json&excluded_attributes=visible,accessible ") {
+                tree_with_cells(3, "far")
+            } else {
+                assert!(request.starts_with("GET /source?format=json "), "{request}");
+                r#"{"value":{"type":"XCUIElementTypeApplication","rect":{"x":0,"y":0,"width":440,"height":956},
+                   "children":[{"type":"XCUIElementTypeButton","label":"behind","isVisible":"0",
+                   "rect":{"x":0,"y":100,"width":40,"height":40}}]}}"#
+                    .to_string()
+            }
+        });
+        let mut client = WdaClient::new(base).unwrap();
+        let rows = block(client.elements()).unwrap();
+        server.join().unwrap();
+        // WDA's own occlusion answer survives for a normal screen.
+        let behind = rows.iter().find(|row| row.label == "behind").unwrap();
+        assert_eq!(behind.visible, Some(false));
+        assert!(rows.iter().all(|row| row.label != "far"), "the probe tree must not be used");
+    }
+
+    #[test]
+    fn a_huge_tree_is_never_read_with_visibility() {
+        // Hardware: WeChat's chat list, 3450 nodes; with isVisible the read
+        // outlived the runner. One request only — a second would hang.
+        let (base, server) = mock_wda(1, |request| {
+            assert!(
+                request.starts_with("GET /source?format=json&excluded_attributes=visible,accessible "),
+                "{request}"
+            );
+            tree_with_cells(1_200, "scrolled away")
+        });
+        let mut client = WdaClient::new(base).unwrap();
+        let rows = block(client.elements()).unwrap();
+        server.join().unwrap();
+        let far = rows.iter().find(|row| row.label == "scrolled away").unwrap();
+        assert_eq!(far.visible, Some(false));
+        let near = rows.iter().find(|row| row.label == "chat 0").unwrap();
+        assert_eq!(near.visible, None);
+    }
+
+    #[test]
+    fn the_read_mode_only_switches_back_well_below_the_limit() {
+        assert!(!keep_lite_source(1_000, 1_000, false));
+        assert!(keep_lite_source(1_001, 1_000, false));
+        // Once lite, a screen hovering just under the limit stays lite...
+        assert!(keep_lite_source(950, 1_000, true));
+        assert!(keep_lite_source(800, 1_000, true));
+        // ...until it is clearly smaller.
+        assert!(!keep_lite_source(799, 1_000, true));
+        assert!(!keep_lite_source(950, 1_000, false));
+    }
+
+    #[test]
+    fn a_huge_tree_keeps_the_next_read_lite_until_it_shrinks() {
+        // 1200 nodes, then 900 (inside the band: still lite, probe only),
+        // then 500 (clearly smaller: probe + full read).
+        let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = probes.clone();
+        let (base, server) = mock_wda(4, move |request| {
+            if !request.contains("excluded_attributes=visible") {
+                return tree_with_cells(10, "far");
+            }
+            match seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => tree_with_cells(1_200, "far"),
+                1 => tree_with_cells(900, "far"),
+                _ => tree_with_cells(500, "far"),
+            }
+        });
+        let mut client = WdaClient::new(base).unwrap();
+        block(async {
+            client.elements().await.unwrap();
+            assert!(client.visibility_is_geometric());
+            client.elements().await.unwrap();
+            assert!(client.visibility_is_geometric(), "900 nodes stays lite once lite");
+            client.elements().await.unwrap();
+            assert!(!client.visibility_is_geometric());
+        });
+        server.join().unwrap();
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_small_tree_is_reread_without_a_probe_until_something_is_sent() {
+        // read: probe + full · read again: full only · tap · read: probe + full.
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = order.clone();
+        let (base, server) = mock_wda(6, move |request| {
+            let what = if request.contains("excluded_attributes=visible") {
+                "probe"
+            } else if request.contains("/source") {
+                "full"
+            } else {
+                "post"
+            };
+            seen.lock().unwrap().push(what);
+            if what == "post" {
+                r#"{"value":null}"#.to_string()
+            } else {
+                tree_with_cells(3, "far")
+            }
+        });
+        let mut client = WdaClient::new(base).unwrap();
+        client.session = Some("SESSION".to_string());
+        block(async {
+            client.elements().await.unwrap();
+            client.elements().await.unwrap();
+            client.tap_point(10.0, 10.0).await.unwrap();
+            client.elements().await.unwrap();
+        });
+        server.join().unwrap();
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["probe", "full", "full", "post", "probe", "full"]
+        );
+    }
+
+    fn app_tree(app: &str, cells: usize) -> serde_json::Value {
+        let children: Vec<serde_json::Value> = (0..cells)
+            .map(|_| serde_json::json!({"type":"XCUIElementTypeCell"}))
+            .collect();
+        serde_json::json!({"type":"XCUIElementTypeApplication","label":app,"children":children})
+    }
+
+    #[test]
+    fn the_probe_runs_only_where_a_huge_tree_is_plausible() {
+        let mut memory = ProbeMemory::default();
+        assert!(memory.should_probe(1_000, false, false), "nothing known yet");
+        for _ in 0..PROBE_WARMUP_READS {
+            assert!(memory.should_probe(1_000, false, false), "warm-up");
+            memory.record(&app_tree("Calculator", 40), 1_000);
+        }
+        // A measured small app after input: straight to the full read.
+        assert!(!memory.should_probe(1_000, false, false));
+        // Near the limit: probe.
+        memory.record(&app_tree("Calculator", 850), 1_000);
+        assert!(memory.should_probe(1_000, false, false));
+        memory.record(&app_tree("Calculator", 40), 1_000);
+        // An app that was ever huge keeps probing, even on its small screens.
+        memory.record(&app_tree("微信", 3_400), 1_000);
+        for _ in 0..10 {
+            memory.record(&app_tree("微信", 70), 1_000);
+        }
+        assert!(memory.should_probe(1_000, false, false));
+        // Nothing sent since a small tree: never, whatever the app.
+        assert!(!memory.should_probe(1_000, true, false));
+        // Lite mode always probes; hysteresis decides when to leave it.
+        assert!(memory.should_probe(1_000, true, true));
+    }
+
+    #[test]
+    fn an_app_switch_probes_unless_the_frontmost_app_is_known_small() {
+        let mut memory = ProbeMemory::default();
+        // A switch to an app WDA cannot name, or a bundle never read: probe.
+        memory.app_switched = true;
+        assert!(memory.should_probe(1_000, false, false));
+        memory.switched_bundle = Some("com.apple.calculator".into());
+        assert!(memory.should_probe(1_000, false, false));
+        memory.record(&app_tree("Calculator", 40), 1_000);
+        for _ in 1..PROBE_WARMUP_READS {
+            memory.record(&app_tree("Calculator", 40), 1_000);
+        }
+        // Away and back: the warm-up does not restart on re-entry, and the
+        // bundle is known small, so the first read after the launch is full.
+        memory.record(&app_tree("主屏幕", 120), 1_000);
+        memory.app_switched = true;
+        memory.switched_bundle = Some("com.apple.calculator".into());
+        assert!(!memory.should_probe(1_000, false, false));
+        // A heavy app stays probed after a switch.
+        memory.app_switched = true;
+        memory.switched_bundle = Some("com.tencent.xin".into());
+        memory.record(&app_tree("微信", 3_400), 1_000);
+        memory.record(&app_tree("主屏幕", 120), 1_000);
+        memory.app_switched = true;
+        memory.switched_bundle = Some("com.tencent.xin".into());
+        assert!(memory.should_probe(1_000, false, false));
+    }
+
+    #[test]
+    fn an_app_switch_post_marks_the_next_read_for_a_probe() {
+        let mut client = WdaClient::new("http://127.0.0.1:9").unwrap();
+        let _ = client.post_req("http://127.0.0.1:9/session/S/actions".to_string());
+        assert!(!client.probe.app_switched);
+        let _ = client.post_req("http://127.0.0.1:9/session/S/wda/apps/launch".to_string());
+        assert!(client.probe.app_switched);
+    }
+
+    #[test]
+    fn rows_without_area_or_outside_the_root_are_not_visible() {
+        let tree = serde_json::json!({"rect":{"x":0,"y":0,"width":440,"height":956}});
+        let row = |rect: [f64; 4]| ElementRow { rect, ..Default::default() };
+        let mut rows = vec![
+            row([0.0, 900.0, 440.0, 100.0]),  // straddles the bottom edge
+            row([0.0, 956.0, 440.0, 60.0]),   // starts right below
+            row([-60.0, 10.0, 60.0, 60.0]),   // ends right at the left edge
+            row([10.0, 10.0, 0.0, 30.0]),     // no width
+        ];
+        mark_rows_outside_root(&tree, &mut rows);
+        let visible: Vec<_> = rows.iter().map(|row| row.visible).collect();
+        assert_eq!(visible, [None, Some(false), Some(false), Some(false)]);
     }
 
     #[test]
