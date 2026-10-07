@@ -2256,6 +2256,7 @@ mod tests {
             ("200 OK", elements),
         ]);
         let store = tempfile::tempdir().unwrap();
+        let _env = crate::TEST_ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("PHONE_REMOTE_URL", &url);
         std::env::set_var(registry::STORE_ENV, store.path());
 
