@@ -6850,6 +6850,14 @@ async fn reveal_and_click(
     let [id] = ids.as_slice() else {
         return None;
     };
+    reveal_element(w, id).await;
+    Some(w.click_element(id).await)
+}
+
+/// Scroll a live element clear of floating bars and wait until it stops
+/// moving. Shared by every element tap whose centre is covered, so snapshot,
+/// label and locator taps (single or batched) reveal the same way.
+async fn reveal_element(w: &mut crate::wda::WdaClient, id: &str) {
     // Best effort: a scroll WDA calls failed can still have moved it.
     if let Err(error) = w.scroll_element_to_visible(id).await {
         tracing::info!("reveal before tap: scrollTo said {error:#}");
@@ -6870,7 +6878,6 @@ async fn reveal_and_click(
         last = Some(rect);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    Some(w.click_element(id).await)
 }
 
 async fn tap_unique_locator(
@@ -6881,31 +6888,39 @@ async fn tap_unique_locator(
     // Same reuse as label taps: a recent untouched tree may prove uniqueness,
     // and the live lookup below (exactly one element, same frame) proves the
     // target; otherwise read afresh.
-    let reused = w.recent_tree(SNAPSHOT_TREE_REUSE).and_then(|rows| {
+    // The unique match's index in `rows`; `Err(true)` when several match.
+    fn unique_match(
+        rows: &[crate::wda::ElementRow],
+        locator: &AgentElementLocator,
+    ) -> Result<usize, bool> {
         let mut matches = rows
             .iter()
-            .filter(|row| agent_locator_matches(row, locator));
+            .enumerate()
+            .filter(|(_, row)| agent_locator_matches(row, locator));
         match (matches.next(), matches.next()) {
-            (Some(row), None) => Some(row.rect),
-            _ => None,
+            (Some((index, _)), None) => Ok(index),
+            (None, _) => Err(false),
+            _ => Err(true),
         }
+    }
+    let reused = w.recent_tree(SNAPSHOT_TREE_REUSE).and_then(|rows| {
+        unique_match(&rows, locator)
+            .ok()
+            .map(|index| (rows[index].rect, center_covered(&rows, index)))
     });
-    let reused_rect = match reused {
-        Some(rect) => Some(rect),
+    let (reused_rect, covered) = match reused {
+        Some((rect, covered)) => (Some(rect), covered),
         None => {
             w.forget_tree();
             let rows = w
                 .elements()
                 .await
                 .map_err(UniqueLabelTapError::BeforeDispatch)?;
-            let mut matches = rows
-                .iter()
-                .filter(|row| agent_locator_matches(row, locator));
-            matches.next().ok_or(UniqueLabelTapError::NotFound)?;
-            if matches.next().is_some() {
-                return Err(UniqueLabelTapError::Ambiguous(None));
+            match unique_match(&rows, locator) {
+                Ok(index) => (None, center_covered(&rows, index)),
+                Err(false) => return Err(UniqueLabelTapError::NotFound),
+                Err(true) => return Err(UniqueLabelTapError::Ambiguous(None)),
             }
-            None
         }
     };
 
@@ -6936,6 +6951,12 @@ async fn tap_unique_locator(
             w.forget_tree();
             return Box::pin(tap_unique_locator(w, locator, via_point)).await;
         }
+    }
+    // A floating bar over the target's centre (iOS 26's search pill) eats
+    // XCUIElement's click there too: reveal it first, like snapshot and label
+    // taps do.
+    if covered {
+        reveal_element(w, element_id).await;
     }
     if via_point {
         // `"via":"point"`: some custom controls ignore XCUIElement's click

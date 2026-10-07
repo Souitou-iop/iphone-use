@@ -21,7 +21,7 @@ use axum::http::{header, Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use support::{block, build_state, build_state_with_wda, mock_wda};
+use support::{block, build_state, build_state_with_wda, mock_wda, mock_wda_with_apps};
 
 const SESSION: &str = r#"{"value":{"sessionId":"SESSION"}}"#;
 
@@ -294,6 +294,136 @@ fn an_optional_alert_step_passes_when_no_alert_is_up() {
         )
         .await;
         assert_eq!(strict["error"], "no_alert", "{strict}");
+    });
+}
+
+/// A batched `tap_locator` whose target sits under iOS 26's floating search
+/// field scrolls it into view before clicking (hardware, iPhone 13 Settings:
+/// a plain click on 通用 under the pill ACKed and did nothing).
+#[test]
+fn a_covered_locator_tap_reveals_before_clicking() {
+    block(async {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let record = seen.clone();
+        let wda = mock_wda(move |request, _| {
+            record.lock().unwrap().push(request.to_string());
+            if request.starts_with("POST /session ") {
+                return Some((Duration::ZERO, SESSION.to_string()));
+            }
+            if request.contains("/source?format=json") {
+                return Some((
+                    Duration::ZERO,
+                    r#"{"value":{"type":"XCUIElementTypeApplication","label":"设置","rect":{"x":0,"y":0,"width":390,"height":844},"children":[
+                        {"type":"XCUIElementTypeButton","label":"电池","rect":{"x":16,"y":661,"width":358,"height":49}},
+                        {"type":"XCUIElementTypeButton","label":"通用","rect":{"x":16,"y":745,"width":358,"height":51}},
+                        {"type":"XCUIElementTypeSearchField","label":"搜索","rect":{"x":28,"y":778,"width":334,"height":28}}]}}"#
+                        .to_string(),
+                ));
+            }
+            if request.starts_with("POST ") && request.contains("/elements") {
+                return Some((Duration::ZERO, r#"{"value":[{"ELEMENT":"E1","element-6066-11e4-a52e-4f735466cecf":"E1"}]}"#.to_string()));
+            }
+            if request.contains("/element/E1/rect") {
+                return Some((Duration::ZERO, r#"{"value":{"x":16,"y":400,"width":358,"height":51}}"#.to_string()));
+            }
+            Some((Duration::ZERO, r#"{"value":null}"#.to_string()))
+        });
+        let (status, json) = post_actions(
+            Some(wda.url()),
+            r#"{"steps":[{"kind":"action","action":{"type":"tap_locator","locator":{"label":"通用","kind":"Button"}}}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let seen = seen.lock().unwrap();
+        let scroll = seen.iter().position(|r| r.contains("/E1/scrollTo")).expect("a reveal scroll");
+        let click = seen.iter().position(|r| r.contains("/E1/click")).expect("an element click");
+        assert!(scroll < click, "reveal before click: {seen:?}");
+    });
+}
+
+/// Spotlight opens through the search pill's identifier. On iOS 26 the
+/// localized "搜索" also names the pill's own image and text, so a lookup that
+/// matches labels found three elements and the shortcut failed as ambiguous
+/// (hardware, iPhone 13: 502 `outcome_unknown`, single and batched alike).
+#[test]
+fn spotlight_opens_through_the_pill_identifier() {
+    block(async {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let record = seen.clone();
+        let springboard = r#"[{"bundleId":"com.apple.springboard"}]"#;
+        let wda = mock_wda_with_apps(springboard, move |request, _| {
+            record.lock().unwrap().push(request.to_string());
+            if request.starts_with("POST /session ") {
+                return Some((Duration::ZERO, SESSION.to_string()));
+            }
+            if request.starts_with("POST ") && request.contains("/elements") {
+                let element = |id: &str| {
+                    format!(r#"{{"ELEMENT":"{id}","element-6066-11e4-a52e-4f735466cecf":"{id}"}}"#)
+                };
+                // Hardware, iPhone 13: the pill and a same-frame wrapper share
+                // the identifier.
+                let found = if request.contains("spotlight-pill") {
+                    vec![element("PILL"), element("WRAP")]
+                } else if request.contains("SpotlightSearchField") {
+                    vec![element("FIELD")]
+                } else if request.contains("搜索") {
+                    vec![element("PILL"), element("IMG"), element("TEXT")]
+                } else {
+                    vec![]
+                };
+                return Some((Duration::ZERO, format!(r#"{{"value":[{}]}}"#, found.join(","))));
+            }
+            if request.contains("/element/PILL/rect") || request.contains("/element/WRAP/rect") {
+                return Some((Duration::ZERO, r#"{"value":{"x":164,"y":688,"width":61,"height":30}}"#.to_string()));
+            }
+            Some((Duration::ZERO, r#"{"value":null}"#.to_string()))
+        });
+        let (status, json) = post_actions(
+            Some(wda.url()),
+            r#"{"steps":[{"kind":"action","action":{"type":"shortcut","name":"spotlight"}}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["ok"], true, "{json}");
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|r| r.contains("/element/PILL/click")), "{seen:?}");
+    });
+}
+
+/// An uncovered `tap_locator` clicks straight away: no reveal scroll.
+#[test]
+fn a_clear_locator_tap_does_not_scroll() {
+    block(async {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let record = seen.clone();
+        let wda = mock_wda(move |request, _| {
+            record.lock().unwrap().push(request.to_string());
+            if request.starts_with("POST /session ") {
+                return Some((Duration::ZERO, SESSION.to_string()));
+            }
+            if request.contains("/source?format=json") {
+                return Some((
+                    Duration::ZERO,
+                    r#"{"value":{"type":"XCUIElementTypeApplication","label":"设置","rect":{"x":0,"y":0,"width":390,"height":844},"children":[
+                        {"type":"XCUIElementTypeButton","label":"电池","rect":{"x":16,"y":661,"width":358,"height":49}},
+                        {"type":"XCUIElementTypeSearchField","label":"搜索","rect":{"x":28,"y":778,"width":334,"height":28}}]}}"#
+                        .to_string(),
+                ));
+            }
+            if request.starts_with("POST ") && request.contains("/elements") {
+                return Some((Duration::ZERO, r#"{"value":[{"ELEMENT":"E1","element-6066-11e4-a52e-4f735466cecf":"E1"}]}"#.to_string()));
+            }
+            Some((Duration::ZERO, r#"{"value":null}"#.to_string()))
+        });
+        let (status, json) = post_actions(
+            Some(wda.url()),
+            r#"{"steps":[{"kind":"action","action":{"type":"tap_locator","locator":{"label":"电池","kind":"Button"}}}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let seen = seen.lock().unwrap();
+        assert!(!seen.iter().any(|r| r.contains("/scrollTo")), "no reveal: {seen:?}");
+        assert!(seen.iter().any(|r| r.contains("/E1/click")), "{seen:?}");
     });
 }
 
