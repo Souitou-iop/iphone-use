@@ -930,7 +930,10 @@ impl WdaClient {
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let element = 'found: loop {
-            for label in ["搜索", "Search", "検索"] {
+            // The pill's identifier first: it names one element on every
+            // runner, while the localized label also names the pill's own
+            // image and text where a lookup matches labels as well.
+            for label in ["spotlight-pill", "搜索", "Search", "検索"] {
                 let Ok(elements) = tokio::time::timeout(
                     left(deadline),
                     self.find_elements("accessibility id", label),
@@ -939,10 +942,27 @@ impl WdaClient {
                 else {
                     break;
                 };
-                match elements?.as_slice() {
+                let elements = elements?;
+                match elements.as_slice() {
                     [element] => break 'found element.clone(),
                     [] => {}
-                    _ => return Err(anyhow!("Spotlight Search element is ambiguous for {label}")),
+                    // iOS 26 nests the pill in a wrapper with the same
+                    // identifier and frame (hardware, iPhone 13): several
+                    // elements on one frame are one control.
+                    [first, rest @ ..] => {
+                        let frame = self.element_rect(first).await?;
+                        let mut same = true;
+                        for other in rest {
+                            if self.element_rect(other).await? != frame {
+                                same = false;
+                                break;
+                            }
+                        }
+                        if same {
+                            break 'found first.clone();
+                        }
+                        return Err(anyhow!("Spotlight Search element is ambiguous for {label}"));
+                    }
                 }
             }
             if std::time::Instant::now() >= deadline {

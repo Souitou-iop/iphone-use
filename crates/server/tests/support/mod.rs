@@ -107,6 +107,19 @@ pub fn mock_wda(
         + std::panic::RefUnwindSafe
         + 'static,
 ) -> MockWda {
+    mock_wda_with_apps("[]", responder)
+}
+
+/// [`mock_wda`] whose `/wda/apps/list` answers `apps` (a JSON array) instead
+/// of the default empty list, for flows that wait on the front app.
+#[allow(dead_code)]
+pub fn mock_wda_with_apps(
+    apps: &'static str,
+    responder: impl Fn(&str, usize) -> Option<(std::time::Duration, String)>
+        + Send
+        + std::panic::RefUnwindSafe
+        + 'static,
+) -> MockWda {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -149,7 +162,7 @@ pub fn mock_wda(
             // in front. No test here scripts that: answer "unknown", which
             // sends the read through the probe answered above.
             if request.contains("/wda/apps/list") {
-                let body = r#"{"value":[]}"#;
+                let body = format!(r#"{{"value":{apps}}}"#);
                 let _ = write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

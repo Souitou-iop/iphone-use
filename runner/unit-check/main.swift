@@ -98,6 +98,11 @@ let tree = UINode(raw: node("Application", label: "Settings", rect: [0, 0, 390, 
       node("PickerWheel", value: "2026", rect: [260, 600, 130, 200]),
     ]),
     node("Cell", rect: [0, 900, 390, 44], children: [node("StaticText", label: "Offscreen", rect: [0, 900, 100, 44])]),
+    // iOS 26 SpringBoard's search pill: the container and both children carry the label.
+    node("Other", label: "搜索", id: "spotlight-pill", rect: [164, 688, 61, 30], children: [
+      node("Image", label: "搜索", id: "magnifyingglass", rect: [176, 697, 11, 11]),
+      node("StaticText", label: "搜索", rect: [190, 695, 24, 14]),
+    ]),
   ]),
 ]), parent: nil, pid: 1)
 
@@ -108,6 +113,13 @@ do {
         "accessibility id matches identifier")
   check(labels(try Locator.find(using: "accessibility id", value: "Done", root: tree, screen: screen)) == ["Done"],
         "accessibility id matches label")
+  check(try Locator.find(using: "accessibility id", value: "OK", root: tree, screen: screen).isEmpty,
+        "accessibility id ignores the label of an element that has an identifier (WDA name)")
+  let pillText = try Locator.find(using: "accessibility id", value: "搜索", root: tree, screen: screen)
+  check(pillText.count == 1 && pillText.first?.type == "XCUIElementTypeStaticText",
+        "accessibility id 搜索 names only the pill's text, as on WDA")
+  check(try Locator.find(using: "accessibility id", value: "spotlight-pill", root: tree, screen: screen).count == 1,
+        "accessibility id finds the pill by its identifier")
   check(try Locator.find(using: "class name", value: "XCUIElementTypePickerWheel", root: tree, screen: screen).count == 3,
         "class name")
   let dismiss = "type == 'XCUIElementTypeButton' AND (name IN {'Hide keyboard', 'Done'} OR label IN {'Hide keyboard', 'Done'})"

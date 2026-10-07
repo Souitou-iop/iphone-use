@@ -116,8 +116,11 @@ enum Locator {
   static func find(using: String, value: String, root: UINode, screen: CGSize) throws -> [UINode] {
     switch using {
     case "accessibility id", "id", "name":
-      // XCUI's identifier matching (what WDA uses) matches the identifier or, failing that, the label.
-      return root.descendants().filter { $0.identifier == value || $0.label == value }
+      // WDA matches the element's name: its identifier when it has one, else its label. Matching
+      // identifier-or-label on every node also returned labelled containers' children (iOS 26
+      // SpringBoard: the "spotlight-pill" plus its "搜索" image and text), so lookups WDA
+      // answered with one element came back ambiguous.
+      return root.descendants().filter { $0.name == value }
     case "class name":
       let type = RunnerElementTypes.normalize(value)
       return root.descendants().filter { $0.type == type }
