@@ -795,6 +795,7 @@ pub fn publish_source(target: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::TEST_ENV as ENV_LOCK;
     use std::fs;
 

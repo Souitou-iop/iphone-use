@@ -33,6 +33,7 @@ mod contrib;
 mod flow;
 mod jev;
 mod outputs;
+mod private_fs;
 mod registry;
 mod schedule;
 mod server;

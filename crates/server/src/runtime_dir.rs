@@ -24,24 +24,41 @@ use std::path::{Path, PathBuf};
 ///
 /// If the directory already exists its owner and mode are validated; an
 /// `io::Error` with kind `PermissionDenied` is returned if either check fails.
+#[cfg(unix)]
 pub fn runtime_dir() -> io::Result<PathBuf> {
     let uid = current_uid();
-    // Windows has no $TMPDIR convention; std's temp dir is per-user there.
-    #[cfg(unix)]
     let base = std::env::var("TMPDIR")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/tmp".to_owned());
-    #[cfg(not(unix))]
-    let base = std::env::temp_dir().to_string_lossy().into_owned();
     let dir = PathBuf::from(base).join(dir_name(uid, crate::instance::current()));
     ensure_dir(&dir)?;
     Ok(dir)
 }
 
+/// Windows: `%TEMP%\hermes-phone-remote` (`-<instance>` appended for a named
+/// instance). `%TEMP%` is already per user, so the name carries no uid.
+#[cfg(not(unix))]
+pub fn runtime_dir() -> io::Result<PathBuf> {
+    let name = dir_name_without_uid(crate::instance::current());
+    let dir = std::env::temp_dir().join(name);
+    ensure_dir(&dir)?;
+    Ok(dir)
+}
+
+#[cfg(not(unix))]
+fn dir_name_without_uid(instance: &crate::instance::Instance) -> String {
+    if instance.is_default() {
+        "hermes-phone-remote".to_owned()
+    } else {
+        format!("hermes-phone-remote-{}", instance.name)
+    }
+}
+
 /// The pid record and session secret are per daemon: a named instance (#67)
 /// gets its own directory so the default daemon's live pid record does not
 /// read as "already running" to it.
+#[cfg(unix)]
 fn dir_name(uid: u32, instance: &crate::instance::Instance) -> String {
     if instance.is_default() {
         format!("hermes-phone-remote-{uid}")
@@ -97,7 +114,12 @@ pub(crate) fn ensure_dir(dir: &Path) -> io::Result<()> {
 
 /// Validate that `dir` is owned by the current uid and has mode exactly 0700.
 pub(crate) fn validate_dir(dir: &Path) -> io::Result<()> {
+    // Unix wants the real directory behind the path; Windows wants the entry
+    // itself, so a planted junction reads as a reparse point, not a dir.
+    #[cfg(unix)]
     let meta = fs::metadata(dir)?; // follows symlinks — we want the dir itself
+    #[cfg(not(unix))]
+    let meta = dir.symlink_metadata()?;
     // Owner and mode checks are Unix-only: Windows has no POSIX uid or mode
     // bits, and the per-user temp dir already scopes the directory's ACL.
     #[cfg(unix)]
@@ -130,7 +152,7 @@ pub(crate) fn validate_dir(dir: &Path) -> io::Result<()> {
     if !meta.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("runtime dir {:?} is not a directory", dir),
+            format!("runtime dir {:?} is not a plain directory", dir),
         ));
     }
     Ok(())
@@ -213,8 +235,7 @@ pub(crate) fn read_secret_in(dir: &Path, name: &str) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Return the effective UID of the current process (0 on platforms without a
-/// POSIX uid).
+/// Return the effective UID of the current process.
 #[cfg(unix)]
 fn current_uid() -> u32 {
     // SAFETY: `geteuid` takes no arguments, has no preconditions, and always
@@ -222,21 +243,27 @@ fn current_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-#[cfg(not(unix))]
-fn current_uid() -> u32 {
-    0
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
+    #[cfg(not(unix))]
+    #[test]
+    fn a_named_instance_gets_its_own_runtime_dir() {
+        let default = crate::instance::Instance::derive("", "C:\\Users\\x", None).unwrap();
+        let lab = crate::instance::Instance::derive("lab", "C:\\Users\\x", None).unwrap();
+        assert_eq!(dir_name_without_uid(&default), "hermes-phone-remote");
+        assert_eq!(dir_name_without_uid(&lab), "hermes-phone-remote-lab");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_named_instance_gets_its_own_runtime_dir() {
         let default = crate::instance::Instance::derive("", "/Users/x", None).unwrap();
@@ -245,9 +272,11 @@ mod tests {
         assert_eq!(dir_name(501, &lab), "hermes-phone-remote-501-lab");
     }
 
-    // Helper: create a fresh 0700 tempdir.
+    // Helper: create a fresh 0700 tempdir (a plain one where there are no
+    // mode bits).
     fn tmp700() -> TempDir {
         let td = TempDir::new().unwrap();
+        #[cfg(unix)]
         fs::set_permissions(td.path(), fs::Permissions::from_mode(0o700)).unwrap();
         td
     }
@@ -270,6 +299,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn read_refuses_wrong_mode() {
         let td = tmp700();
         write_secret_in(td.path(), "tok", b"data").unwrap();
@@ -281,6 +311,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn read_refuses_symlink() {
         let td = tmp700();
         // Create the real file in a separate temp location.
@@ -296,6 +327,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn validate_dir_rejects_non_700() {
         let td = TempDir::new().unwrap();
         // tempfile creates dirs with 0700 on most systems; set 0755 explicitly.
@@ -305,6 +337,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn ensure_dir_creates_with_0700() {
         let parent = TempDir::new().unwrap();
         let target = parent.path().join("new-dir");

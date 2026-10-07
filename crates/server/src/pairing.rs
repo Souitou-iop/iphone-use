@@ -157,23 +157,19 @@ fn interface_ipv4s() -> Vec<(String, Ipv4Addr)> {
     out
 }
 
-/// Windows libc has no getifaddrs: ask the OS which local address a UDP
-/// "connect" to a public address would route through (no packet is sent).
-/// One entry is enough — the pairing QR only needs a LAN IP.
-#[cfg(windows)]
+/// Windows has no `getifaddrs`. The address the OS would route an outbound
+/// packet from is the one the phone can reach in practice, and asking for it
+/// needs no packet: `connect` on a UDP socket only picks the route.
+#[cfg(not(unix))]
 fn interface_ipv4s() -> Vec<(String, Ipv4Addr)> {
-    std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|socket| {
-            socket.connect("8.8.8.8:80")?;
-            socket.local_addr()
-        })
-        .ok()
-        .and_then(|addr| match addr.ip() {
-            std::net::IpAddr::V4(v4) => Some(v4),
-            std::net::IpAddr::V6(_) => None,
-        })
-        .map(|ip| vec![("default".to_owned(), ip)])
-        .unwrap_or_default()
+    let local = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).and_then(|socket| {
+        socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
+        socket.local_addr()
+    });
+    match local {
+        Ok(std::net::SocketAddr::V4(addr)) => vec![("default-route".to_owned(), *addr.ip())],
+        _ => Vec::new(),
+    }
 }
 
 /// True for `localhost`, `127.x`, `::1` — hosts a phone cannot use.

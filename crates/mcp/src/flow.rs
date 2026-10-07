@@ -471,25 +471,14 @@ pub fn read_flow_bytes(path: &Path) -> Result<Vec<u8>> {
     // symlink without a metadata/open race. Flow files can contain text and
     // taps with real-world effects, so only regular, current-user-owned files
     // that are not group/world-writable are accepted.
-    #[cfg(unix)]
-    let mut file = {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .with_context(|| {
-                format!(
-                    "open flow file without following symlinks: {}",
-                    path.display()
-                )
-            })?
-    };
-    #[cfg(not(unix))]
-    let mut file = OpenOptions::new()
-        .read(true)
+    let mut file = crate::private_fs::no_follow(OpenOptions::new().read(true))
         .open(path)
-        .with_context(|| format!("open flow file: {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "open flow file without following symlinks: {}",
+                path.display()
+            )
+        })?;
     let metadata = file
         .metadata()
         .with_context(|| format!("inspect flow file: {}", path.display()))?;
@@ -599,14 +588,9 @@ pub fn save_draft(path: &str, flow: &serde_json::Value) -> Result<serde_json::Va
     if !flow.is_object() {
         bail!("the daemon returned no flow document");
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options
+    let mut file = crate::private_fs::file_options()
+        .write(true)
+        .create_new(true)
         .open(path)
         .with_context(|| format!("create {path} (it must not exist yet)"))?;
     let mut bytes = serde_json::to_vec_pretty(flow)?;
@@ -678,18 +662,9 @@ impl ArtifactsDir {
         let mut last = None;
         for _ in 0..8 {
             let dir = base.join(format!("run-{}", unique_suffix()));
-            let created = {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::DirBuilderExt as _;
-                    std::fs::DirBuilder::new()
-                        .recursive(false)
-                        .mode(0o700)
-                        .create(&dir)
-                }
-                #[cfg(not(unix))]
-                std::fs::DirBuilder::new().recursive(false).create(&dir)
-            };
+            let created = crate::private_fs::dir_builder()
+                .recursive(false)
+                .create(&dir);
             match created {
                 Ok(()) => return Ok(Self { dir }),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -709,7 +684,7 @@ impl ArtifactsDir {
     }
 
     /// The directory this run writes into.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(unix)), allow(dead_code))]
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -730,14 +705,11 @@ impl ArtifactsDir {
                 format!("{stem}-{}.json", unique_suffix())
             };
             let path = self.dir.join(name);
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
+            match crate::private_fs::file_options()
+                .write(true)
+                .create_new(true)
+                .open(&path)
             {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                options.mode(0o600);
-            }
-            match options.open(&path) {
                 Ok(mut file) => {
                     use std::io::Write as _;
                     file.write_all(&body)

@@ -71,17 +71,9 @@ pub fn store_dir() -> Result<PathBuf> {
 
 fn ensure_private_dir(dir: &Path) -> Result<()> {
     if !dir.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)
-                .with_context(|| format!("create flow store {}", dir.display()))?;
-        }
-        #[cfg(not(unix))]
-        fs::create_dir_all(dir)
+        crate::private_fs::dir_builder()
+            .recursive(true)
+            .create(dir)
             .with_context(|| format!("create flow store {}", dir.display()))?;
     }
     if !dir.is_dir() {
@@ -462,16 +454,13 @@ fn write_private_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     let _ = fs::remove_file(&tmp);
     {
         use std::io::Write as _;
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut file = options
-            .open(&tmp)
-            .with_context(|| format!("create {}", tmp.display()))?;
+        let mut file = crate::private_fs::no_follow(
+            crate::private_fs::file_options()
+                .write(true)
+                .create_new(true),
+        )
+        .open(&tmp)
+        .with_context(|| format!("create {}", tmp.display()))?;
         file.write_all(bytes)
             .with_context(|| format!("write {}", tmp.display()))?;
         file.sync_all().ok();

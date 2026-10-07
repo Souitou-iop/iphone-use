@@ -1039,6 +1039,7 @@ cases:
 
     /// A daemon that answers by path: status drivable, every action OK except
     /// a `wait_for` looking for "关于本机", which times out.
+    #[cfg(unix)]
     fn path_daemon() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

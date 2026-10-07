@@ -306,6 +306,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn on_disk_verification_refuses_a_symlinked_state_dir() {
         let root = std::env::temp_dir().join(format!("iu-inst-{}", std::process::id()));
         let real = root.join("real");

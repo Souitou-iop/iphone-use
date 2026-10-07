@@ -1,6 +1,10 @@
 //! The scheduler end to end: a scripted daemon API plus a fake
 //! `iphone-use-mcp`, so the gate, the command line, the owner lease and the
 //! run history are exercised without a phone.
+//!
+//! The fake MCP is a shell-script stub with an exec bit — Unix only.
+
+#![cfg(unix)]
 
 mod support;
 

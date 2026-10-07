@@ -32,7 +32,9 @@ mod onboarding;
 const PID_FILE: &str = "iphone-use.pid";
 /// Secret file name inside the runtime dir.
 const SECRET_FILE: &str = "secret";
+#[cfg(unix)]
 const PID_RECORD_VERSION: u8 = 1;
+#[cfg(unix)]
 const STOP_WAIT_SECS: u64 = 5;
 /// Seconds to sleep before exiting on an unattended startup failure, so a
 /// launchd `KeepAlive` relaunch loop stays gentle instead of spinning (issue #28).
@@ -290,26 +292,27 @@ fn update_notice() {
 }
 
 /// Is `program` an executable somewhere on `$PATH`?
+#[cfg(unix)]
 fn on_path(program: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
     std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path).any(|dir| {
             std::fs::metadata(dir.join(program))
-                .is_ok_and(|meta| meta.is_file() && is_executable_file(&meta))
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         })
     })
 }
 
-/// Unix: an entry on PATH must carry an execute bit. Platforms without mode
-/// bits accept any regular file.
-#[cfg(unix)]
-fn is_executable_file(meta: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    meta.permissions().mode() & 0o111 != 0
-}
-
+/// Windows has no execute bit; a program is runnable by its extension.
 #[cfg(not(unix))]
-fn is_executable_file(_meta: &std::fs::Metadata) -> bool {
-    true
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            ["exe", "cmd", "bat"]
+                .iter()
+                .any(|ext| dir.join(program).with_extension(ext).is_file())
+        })
+    })
 }
 
 /// Download install.sh into a private temp dir, then run it the way the
@@ -1090,6 +1093,7 @@ fn persist_generated_secret(dir: &std::path::Path, secret: Vec<u8>) -> Result<Ve
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProcessIdentity {
@@ -1099,6 +1103,7 @@ struct ProcessIdentity {
     argv: String,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PidRecord {
@@ -1107,11 +1112,13 @@ struct PidRecord {
     identity: ProcessIdentity,
 }
 
+#[cfg(unix)]
 enum ParsedPidRecord {
     Structured(PidRecord),
     Legacy(i32),
 }
 
+#[cfg(unix)]
 struct PidFileContents {
     bytes: Vec<u8>,
     mode: u32,
@@ -1123,13 +1130,9 @@ fn current_euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-#[cfg(not(unix))]
-fn current_euid() -> u32 {
-    0
-}
-
 /// Read one `ps` field. A missing process is represented as `None`; inability
 /// to execute or decode `/bin/ps` is an error so callers fail closed.
+#[cfg(unix)]
 fn ps_field(pid: i32, field: &str) -> Result<Option<String>> {
     if pid <= 1 {
         anyhow::bail!("refusing unsafe pid {pid}");
@@ -1162,6 +1165,7 @@ fn ps_field(pid: i32, field: &str) -> Result<Option<String>> {
 /// Snapshot the fields used to distinguish the daemon from a reused or
 /// attacker-selected pid. Reading `lstart` both before and after the other
 /// fields avoids accepting a mixed snapshot if the pid changes mid-query.
+#[cfg(unix)]
 fn read_process_identity(pid: i32) -> Result<Option<ProcessIdentity>> {
     let Some(started_at) = ps_field(pid, "lstart")? else {
         return Ok(None);
@@ -1192,6 +1196,7 @@ fn read_process_identity(pid: i32) -> Result<Option<ProcessIdentity>> {
     }))
 }
 
+#[cfg(unix)]
 fn parse_pid_record(bytes: &[u8]) -> Result<ParsedPidRecord> {
     if let Ok(record) = serde_json::from_slice::<PidRecord>(bytes) {
         if record.version != PID_RECORD_VERSION {
@@ -1213,6 +1218,7 @@ fn parse_pid_record(bytes: &[u8]) -> Result<ParsedPidRecord> {
     Ok(ParsedPidRecord::Legacy(pid))
 }
 
+#[cfg(unix)]
 fn validate_pid_identity(record: &PidRecord, observed: &ProcessIdentity) -> Result<()> {
     let euid = current_euid();
     if record.identity.euid != euid {
@@ -1267,33 +1273,10 @@ fn read_pid_file(path: &std::path::Path) -> std::io::Result<PidFileContents> {
     })
 }
 
-#[cfg(not(unix))]
-fn read_pid_file(path: &std::path::Path) -> std::io::Result<PidFileContents> {
-    // Windows has no POSIX owner/mode bits: the runtime dir is already scoped
-    // to one user, and the file's ACL follows from it. Report the expected
-    // mode so the 0600 sanity checks below stay platform-neutral.
-    let metadata = std::fs::metadata(path)?;
-    if !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "pid record must be a regular file",
-        ));
-    }
-    let bytes = std::fs::read(path)?;
-    if bytes.len() > 64 * 1024 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "pid record exceeds 64 KiB",
-        ));
-    }
-    Ok(PidFileContents {
-        bytes,
-        mode: 0o600,
-    })
-}
-
+#[cfg(unix)]
 fn atomic_replace_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let parent = path
@@ -1308,14 +1291,11 @@ fn atomic_replace_private(path: &std::path::Path, contents: &[u8]) -> std::io::R
     for _ in 0..32 {
         let nonce = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let candidate = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), nonce));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let file = options.open(&candidate);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate);
         match file {
             Ok(file) => {
                 staged = Some((candidate, file));
@@ -1333,29 +1313,12 @@ fn atomic_replace_private(path: &std::path::Path, contents: &[u8]) -> std::io::R
     };
 
     let result = (|| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
-        #[cfg(unix)]
-        {
-            std::fs::rename(&staged_path, path)?;
-            std::fs::File::open(parent)?.sync_all()?;
-        }
-        #[cfg(not(unix))]
-        {
-            // Windows rename refuses to replace an existing file, so clear the
-            // old record first. There are no mode bits here; the per-user
-            // runtime dir scopes the file's ACL.
-            if path.exists() {
-                std::fs::remove_file(path)?;
-            }
-            std::fs::rename(&staged_path, path)?;
-        }
+        std::fs::rename(&staged_path, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     })();
     if result.is_err() {
@@ -1364,6 +1327,7 @@ fn atomic_replace_private(path: &std::path::Path, contents: &[u8]) -> std::io::R
     result
 }
 
+#[cfg(unix)]
 fn remove_pid_record_if_unchanged(path: &std::path::Path, expected: &[u8]) -> Result<()> {
     match read_pid_file(path) {
         Ok(current) if current.bytes == expected => {
@@ -1378,6 +1342,7 @@ fn remove_pid_record_if_unchanged(path: &std::path::Path, expected: &[u8]) -> Re
 /// Write a versioned, private pid record after refusing to replace a live
 /// daemon record. Returns the exact bytes so shutdown can avoid deleting a
 /// newer daemon's record.
+#[cfg(unix)]
 fn write_pid(dir: &std::path::Path) -> Result<Vec<u8>> {
     let path = dir.join(PID_FILE);
     match read_pid_file(&path) {
@@ -1434,10 +1399,24 @@ fn write_pid(dir: &std::path::Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+// Windows has no `ps` to prove a pid still belongs to this daemon, so it
+// records no pid file at all: the launcher owns the process lifecycle, and a
+// second daemon is already refused by the listener bind.
+#[cfg(not(unix))]
+fn write_pid(_dir: &std::path::Path) -> Result<Vec<u8>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(unix))]
+fn remove_pid_record_if_unchanged(_path: &std::path::Path, _expected: &[u8]) -> Result<()> {
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // stop
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 fn stop() -> Result<()> {
     let dir = server::runtime_dir::runtime_dir().context("locate runtime dir")?;
     let path = dir.join(PID_FILE);
@@ -1480,31 +1459,15 @@ fn stop() -> Result<()> {
     validate_pid_identity(&record, &observed)
         .with_context(|| format!("refusing to signal pid {}", record.pid))?;
 
-    #[cfg(unix)]
-    {
-        // SAFETY: kill is a simple signal send; we send SIGTERM for a graceful stop.
-        let rc = unsafe { libc::kill(record.pid, libc::SIGTERM) };
-        if rc != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error).with_context(|| format!("send SIGTERM to pid {}", record.pid));
-            }
+    // SAFETY: kill is a simple signal send; we send SIGTERM for a graceful stop.
+    let rc = unsafe { libc::kill(record.pid, libc::SIGTERM) };
+    if rc != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).with_context(|| format!("send SIGTERM to pid {}", record.pid));
         }
-        eprintln!("sent SIGTERM to verified pid {}", record.pid);
     }
-    #[cfg(windows)]
-    {
-        // No SIGTERM on Windows: taskkill /F terminates the process. Exit code
-        // 128 means "process not found", which plays ESRCH's part.
-        let status = std::process::Command::new("taskkill")
-            .args(["/F", "/PID", &record.pid.to_string()])
-            .status()
-            .with_context(|| format!("run taskkill for pid {}", record.pid))?;
-        if !(status.success() || status.code() == Some(128)) {
-            anyhow::bail!("taskkill failed for pid {} ({status})", record.pid);
-        }
-        eprintln!("terminated verified pid {} via taskkill", record.pid);
-    }
+    eprintln!("sent SIGTERM to verified pid {}", record.pid);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(STOP_WAIT_SECS);
     loop {
@@ -1530,15 +1493,31 @@ fn stop() -> Result<()> {
     }
 }
 
+// Windows has no `ps` to prove a pid still belongs to this daemon, and no
+// SIGTERM. The process that launched the daemon owns its lifecycle; a second
+// daemon on the same port is already refused by the listener bind.
+#[cfg(not(unix))]
+fn stop() -> Result<()> {
+    anyhow::bail!(
+        "`iphone-use stop` is not supported on this platform yet; stop the daemon from the \
+         app that started it, or with Ctrl+C in its console"
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::{
-        atomic_replace_private, current_euid, endpoint_is_loopback, gen_secret, http_authority,
-        load_or_make_secret, persist_generated_secret, read_process_identity, resolve_managed_wda,
-        socket_host, validate_pid_identity, wda_management_pending, Config, PidRecord,
-        ProcessIdentity, SECRET_FILE,
+        atomic_replace_private, current_euid, load_or_make_secret, persist_generated_secret,
+        read_process_identity, validate_pid_identity, Config, PidRecord, ProcessIdentity,
+        SECRET_FILE,
+    };
+    use super::{
+        endpoint_is_loopback, gen_secret, http_authority, resolve_managed_wda, socket_host,
+        wda_management_pending,
     };
 
+    #[cfg(unix)]
     fn test_config() -> Config {
         Config {
             host: "127.0.0.1".to_owned(),
@@ -1657,6 +1636,7 @@ mod tests {
         assert_eq!(result, winner);
     }
 
+    #[cfg(unix)]
     fn sample_pid_record() -> PidRecord {
         PidRecord {
             version: 1,
@@ -1671,6 +1651,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn pid_reuse_start_time_mismatch_is_rejected() {
         let record = sample_pid_record();
         let mut reused = record.identity.clone();
@@ -1679,6 +1660,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn pid_command_mismatch_is_rejected() {
         let record = sample_pid_record();
         let mut other = record.identity.clone();

@@ -1156,12 +1156,14 @@ mod tests {
 
     // --- skill discovery / refresh ------------------------------------------------
 
+    #[cfg(unix)]
     fn write(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
     }
 
     #[test]
+    #[cfg(unix)]
     fn finds_each_channel_once() {
         let home = tempfile::tempdir().unwrap();
         let home = std::fs::canonicalize(home.path()).unwrap();
@@ -1199,6 +1201,7 @@ mod tests {
         assert_eq!(skills[2].update, COPIED_SKILL_UPDATE);
     }
 
+    #[cfg(unix)]
     fn git(args: &[&str], dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();
         let status = std::process::Command::new("git")
@@ -1233,6 +1236,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_repository_that_vendors_the_skill_is_a_copy_not_a_checkout() {
         let home = tempfile::tempdir().unwrap();
         let home = std::fs::canonicalize(home.path()).unwrap();
@@ -1260,6 +1264,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn git_checkout_is_detected_and_pulled() {
         let home = tempfile::tempdir().unwrap();
         let home = std::fs::canonicalize(home.path()).unwrap();
