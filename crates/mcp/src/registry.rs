@@ -788,10 +788,8 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Tests mutate process env vars; serialize them.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Tests mutate process env vars; serialize them with every other module's.
+    use crate::TEST_ENV as ENV_LOCK;
 
     fn flow_json(name: &str, extra: &str) -> String {
         format!(

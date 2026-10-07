@@ -326,9 +326,10 @@ pub fn verify(
 }
 
 /// Tests that point `IPHONE_USE_FLOW_FIXTURES_DIR` somewhere hold this, so
-/// parallel tests never see each other's directory.
+/// parallel tests never see each other's directory. It is the crate-wide
+/// environment lock.
 #[cfg(test)]
-pub(crate) static FIXTURE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) use crate::TEST_ENV as FIXTURE_ENV;
 
 #[cfg(test)]
 mod tests {

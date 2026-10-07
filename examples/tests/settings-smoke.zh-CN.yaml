@@ -21,8 +21,8 @@ cases:
 
   - name: 打开通用
     steps:
-      # On a small phone the row sits under the floating search bar; scroll it clear.
-      - {kind: scroll, x: 0.5, y: 0.5, dx: 0, dy: 200, after_ms: 2500}
+      # On a small phone the row sits under the floating search bar; the tap
+      # scrolls it clear by itself.
       - {kind: tap_locator, locator: {label: 通用, kind: Button}}
     assert:
       - present: 关于本机

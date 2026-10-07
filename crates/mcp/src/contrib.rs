@@ -795,10 +795,8 @@ pub fn publish_source(target: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TEST_ENV as ENV_LOCK;
     use std::fs;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn flow_file(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
