@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 pub const FLOW_VERSION: u32 = 1;
@@ -464,40 +465,54 @@ pub fn check_input_map(
 
 /// Read a flow file with the same tamper checks the runner has always
 /// applied: no symlinks, regular file, owned by the current uid, not
-/// group/world-writable, 1..=64 KiB.
+/// group/world-writable (owner/mode checks are Unix-only), 1..=64 KiB.
 pub fn read_flow_bytes(path: &Path) -> Result<Vec<u8>> {
     // O_NOFOLLOW makes validation and execution reject a last-component
     // symlink without a metadata/open race. Flow files can contain text and
     // taps with real-world effects, so only regular, current-user-owned files
     // that are not group/world-writable are accepted.
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .with_context(|| {
+                format!(
+                    "open flow file without following symlinks: {}",
+                    path.display()
+                )
+            })?
+    };
+    #[cfg(not(unix))]
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-        .with_context(|| {
-            format!(
-                "open flow file without following symlinks: {}",
-                path.display()
-            )
-        })?;
+        .with_context(|| format!("open flow file: {}", path.display()))?;
     let metadata = file
         .metadata()
         .with_context(|| format!("inspect flow file: {}", path.display()))?;
     if !metadata.file_type().is_file() {
         bail!("flow path is not a regular file: {}", path.display());
     }
-    let effective_uid = unsafe { libc::geteuid() };
-    if metadata.uid() != effective_uid {
-        bail!(
-            "flow file is not owned by the current user (uid {effective_uid}): {}",
-            path.display()
-        );
-    }
-    if metadata.mode() & 0o022 != 0 {
-        bail!(
-            "flow file must not be group- or world-writable: {}",
-            path.display()
-        );
+    // Owner and mode checks are Unix-only: Windows has no POSIX uid or mode
+    // bits, and flow files there live under the user's profile.
+    #[cfg(unix)]
+    {
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid {
+            bail!(
+                "flow file is not owned by the current user (uid {effective_uid}): {}",
+                path.display()
+            );
+        }
+        if metadata.mode() & 0o022 != 0 {
+            bail!(
+                "flow file must not be group- or world-writable: {}",
+                path.display()
+            );
+        }
     }
     if metadata.len() == 0 || metadata.len() > MAX_FLOW_BYTES {
         bail!(
@@ -581,14 +596,17 @@ pub fn load_flow(path: &Path) -> Result<ValidatedFlow> {
 /// what the `todo` list is for — and the error comes back as data.
 pub fn save_draft(path: &str, flow: &serde_json::Value) -> Result<serde_json::Value> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     if !flow.is_object() {
         bail!("the daemon returned no flow document");
     }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(path)
         .with_context(|| format!("create {path} (it must not exist yet)"))?;
     let mut bytes = serde_json::to_vec_pretty(flow)?;
@@ -661,11 +679,16 @@ impl ArtifactsDir {
         for _ in 0..8 {
             let dir = base.join(format!("run-{}", unique_suffix()));
             let created = {
-                use std::os::unix::fs::DirBuilderExt as _;
-                std::fs::DirBuilder::new()
-                    .recursive(false)
-                    .mode(0o700)
-                    .create(&dir)
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt as _;
+                    std::fs::DirBuilder::new()
+                        .recursive(false)
+                        .mode(0o700)
+                        .create(&dir)
+                }
+                #[cfg(not(unix))]
+                std::fs::DirBuilder::new().recursive(false).create(&dir)
             };
             match created {
                 Ok(()) => return Ok(Self { dir }),
@@ -707,12 +730,14 @@ impl ArtifactsDir {
                 format!("{stem}-{}.json", unique_suffix())
             };
             let path = self.dir.join(name);
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
                 Ok(mut file) => {
                     use std::io::Write as _;
                     file.write_all(&body)
@@ -1772,6 +1797,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn rejects_a_symlinked_flow_file() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target.json");
@@ -1785,6 +1811,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn rejects_a_group_or_world_writable_flow_file() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -2024,6 +2051,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn evidence_is_written_private_and_carries_structure_only() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2092,6 +2120,7 @@ mod tests {
     /// The phone has already acted by the time evidence is written. A write
     /// that fails must not rewrite that, and must not look like a failed run.
     #[test]
+    #[cfg(unix)]
     fn a_write_failure_after_the_run_keeps_the_result_intact() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2127,6 +2156,7 @@ mod tests {
     /// Two runs in the same second are two runs. Neither may overwrite the
     /// other's evidence just because the names would collide.
     #[test]
+    #[cfg(unix)]
     fn two_runs_in_the_same_second_keep_both_records() {
         let home = tempfile::tempdir().unwrap();
         let artifacts = ArtifactsDir::prepare(&home.path().join("runs")).unwrap();
@@ -2146,6 +2176,7 @@ mod tests {
     /// Nothing already sitting at the evidence path is touched — not a plain
     /// file, and not a symlink pointing somewhere else entirely.
     #[test]
+    #[cfg(unix)]
     fn an_existing_file_or_symlink_at_the_target_is_never_written_through() {
         let home = tempfile::tempdir().unwrap();
         let artifacts = ArtifactsDir::prepare(&home.path().join("runs")).unwrap();
@@ -2171,6 +2202,7 @@ mod tests {
     /// A directory the user already had is theirs; recording a run does not
     /// quietly tighten its permissions.
     #[test]
+    #[cfg(unix)]
     fn an_existing_directory_keeps_its_own_permissions() {
         use std::os::unix::fs::PermissionsExt;
 

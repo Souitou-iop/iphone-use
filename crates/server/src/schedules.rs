@@ -41,9 +41,13 @@ pub struct LocalTime {
 /// The system's local time for a unix timestamp.
 pub fn local_time(unix: u64) -> LocalTime {
     let t = unix as libc::time_t;
-    // SAFETY: localtime_r writes only into `tm`, which we own.
+    // SAFETY: localtime_r (localtime_s on Windows, with swapped arguments)
+    // writes only into `tm`, which we own.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    #[cfg(unix)]
     unsafe { libc::localtime_r(&t, &mut tm) };
+    #[cfg(windows)]
+    unsafe { libc::localtime_s(&mut tm, &t) };
     LocalTime {
         minute: tm.tm_min as u32,
         hour: tm.tm_hour as u32,
@@ -614,19 +618,30 @@ fn read_store(path: &Path) -> Store {
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("json.tmp");
     {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
-    std::fs::rename(tmp, path)
+    #[cfg(unix)]
+    std::fs::rename(tmp, path)?;
+    #[cfg(not(unix))]
+    {
+        // Windows rename refuses to replace an existing file.
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        std::fs::rename(tmp, path)?;
+    }
+    Ok(())
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -1126,11 +1141,16 @@ impl Scheduler {
         let started = self.now();
         let artifacts = self.config.artifacts_dir.join(&run.id);
         {
-            use std::os::unix::fs::DirBuilderExt;
-            let _ = std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&artifacts);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let _ = std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&artifacts);
+            }
+            #[cfg(not(unix))]
+            let _ = std::fs::create_dir_all(&artifacts);
         }
         self.update_run(&run.id, |run| {
             run.state = RunState::Running;

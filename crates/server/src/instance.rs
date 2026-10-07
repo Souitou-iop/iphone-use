@@ -91,7 +91,6 @@ impl Instance {
     /// someone other than the owner of HOME. A missing directory is fine —
     /// the helper creates it.
     pub fn verify_on_disk(&self) -> Result<(), String> {
-        use std::os::unix::fs::MetadataExt as _;
         let dir = &self.state_dir;
         let Ok(meta) = std::fs::symlink_metadata(dir) else {
             return Ok(());
@@ -118,14 +117,20 @@ impl Instance {
                 canonical.display()
             ));
         }
-        if let Ok(home_meta) = std::fs::metadata(&self.home) {
-            if home_meta.uid() != meta.uid() {
-                return Err(format!(
-                    "state dir {} is owned by uid {} but HOME by uid {}; refusing to use it",
-                    dir.display(),
-                    meta.uid(),
-                    home_meta.uid()
-                ));
+        // Owner checks are Unix-only: Windows has no POSIX uid bits, and the
+        // state dir lives under the user profile there.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if let Ok(home_meta) = std::fs::metadata(&self.home) {
+                if home_meta.uid() != meta.uid() {
+                    return Err(format!(
+                        "state dir {} is owned by uid {} but HOME by uid {}; refusing to use it",
+                        dir.display(),
+                        meta.uid(),
+                        home_meta.uid()
+                    ));
+                }
             }
         }
         Ok(())
@@ -137,7 +142,10 @@ impl Instance {
     /// instance.
     pub fn from_env() -> Result<Instance, String> {
         let name = std::env::var("PHONE_REMOTE_INSTANCE").unwrap_or_default();
-        let home = std::env::var("HOME").unwrap_or_default();
+        // Windows does not set HOME; USERPROFILE is its equivalent.
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_default();
         if home.is_empty() {
             return Err("HOME is not set; cannot derive the instance state dir".into());
         }

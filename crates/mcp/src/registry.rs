@@ -26,7 +26,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 pub const OFFICIAL_SOURCE_NAME: &str = "official";
@@ -72,10 +71,17 @@ pub fn store_dir() -> Result<PathBuf> {
 
 fn ensure_private_dir(dir: &Path) -> Result<()> {
     if !dir.exists() {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .with_context(|| format!("create flow store {}", dir.display()))?;
+        }
+        #[cfg(not(unix))]
+        fs::create_dir_all(dir)
             .with_context(|| format!("create flow store {}", dir.display()))?;
     }
     if !dir.is_dir() {
@@ -456,11 +462,14 @@ fn write_private_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     let _ = fs::remove_file(&tmp);
     {
         use std::io::Write as _;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options
             .open(&tmp)
             .with_context(|| format!("create {}", tmp.display()))?;
         file.write_all(bytes)
@@ -468,9 +477,20 @@ fn write_private_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
         file.sync_all().ok();
     }
     let target = dir.join(name);
+    #[cfg(unix)]
     if let Err(error) = fs::rename(&tmp, &target) {
         let _ = fs::remove_file(&tmp);
         return Err(error).with_context(|| format!("rename into {}", target.display()));
+    }
+    #[cfg(not(unix))]
+    if fs::rename(&tmp, &target).is_err() {
+        // Windows rename refuses to replace an existing file; drop the stale
+        // target and try once more.
+        let _ = fs::remove_file(&target);
+        if let Err(error) = fs::rename(&tmp, &target) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error).with_context(|| format!("rename into {}", target.display()));
+        }
     }
     Ok(())
 }
@@ -849,6 +869,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn update_installs_validates_and_removes_official_flows() {
         let env = setup(&[
             ("system/home", &flow_json("Home", "")),

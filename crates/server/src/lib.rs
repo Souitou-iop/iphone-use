@@ -4,6 +4,8 @@ pub mod flows;
 pub mod focus;
 pub mod http;
 pub mod instance;
+/// Speaks usbmuxd, which only exists on the Mac.
+#[cfg(unix)]
 pub mod lockdown;
 pub mod pairing;
 pub mod protocol;
@@ -12,6 +14,8 @@ pub mod runtime_dir;
 pub mod schedules;
 pub mod timing;
 pub mod update;
+/// usbmuxd is macOS's USB multiplexing daemon.
+#[cfg(unix)]
 pub mod usbmux;
 pub mod video;
 pub mod wda;

@@ -126,6 +126,7 @@ pub fn lan_addresses() -> Vec<(String, Ipv4Addr)> {
     found
 }
 
+#[cfg(unix)]
 fn interface_ipv4s() -> Vec<(String, Ipv4Addr)> {
     let mut out = Vec::new();
     // SAFETY: getifaddrs fills a linked list we walk read-only and free once.
@@ -154,6 +155,25 @@ fn interface_ipv4s() -> Vec<(String, Ipv4Addr)> {
         libc::freeifaddrs(head);
     }
     out
+}
+
+/// Windows libc has no getifaddrs: ask the OS which local address a UDP
+/// "connect" to a public address would route through (no packet is sent).
+/// One entry is enough — the pairing QR only needs a LAN IP.
+#[cfg(windows)]
+fn interface_ipv4s() -> Vec<(String, Ipv4Addr)> {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            socket.connect("8.8.8.8:80")?;
+            socket.local_addr()
+        })
+        .ok()
+        .and_then(|addr| match addr.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .map(|ip| vec![("default".to_owned(), ip)])
+        .unwrap_or_default()
 }
 
 /// True for `localhost`, `127.x`, `::1` — hosts a phone cannot use.

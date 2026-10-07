@@ -42,8 +42,7 @@ const STARTUP_BACKOFF_SECS: u64 = 30;
 /// (stderr redirected to the log file), where a fast crash-relaunch loop is
 /// harmful — see the backoff in [`main`].
 fn stderr_is_tty() -> bool {
-    // SAFETY: `isatty` is a pure libc query on a fixed fd, no memory effects.
-    unsafe { libc::isatty(libc::STDERR_FILENO) == 1 }
+    std::io::IsTerminal::is_terminal(&std::io::stderr())
 }
 
 fn endpoint_is_loopback(value: &str) -> bool {
@@ -173,6 +172,7 @@ enum Command {
     /// Forward a loopback TCP port to a port on a USB-connected iPhone through
     /// macOS's usbmuxd (what libimobiledevice's iproxy did). Setup runs one
     /// for the runner's control port and one for its video port.
+    #[cfg(unix)]
     Relay {
         /// The iPhone's UDID (with or without the dash).
         #[arg(long)]
@@ -189,6 +189,7 @@ enum Command {
     /// Developer Disk Image is mounted). Setup uses these instead of
     /// `devicectl`. Exit 0 on success, 3 when the phone is not attached to
     /// usbmuxd (callers fall back to devicectl), 1 on any other failure.
+    #[cfg(unix)]
     Device {
         #[command(subcommand)]
         query: DeviceQuery,
@@ -290,13 +291,25 @@ fn update_notice() {
 
 /// Is `program` an executable somewhere on `$PATH`?
 fn on_path(program: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
     std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path).any(|dir| {
             std::fs::metadata(dir.join(program))
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+                .is_ok_and(|meta| meta.is_file() && is_executable_file(&meta))
         })
     })
+}
+
+/// Unix: an entry on PATH must carry an execute bit. Platforms without mode
+/// bits accept any regular file.
+#[cfg(unix)]
+fn is_executable_file(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(_meta: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// Download install.sh into a private temp dir, then run it the way the
@@ -459,13 +472,16 @@ fn open_console() -> Result<()> {
         std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok()
     };
     if !answering() {
-        let uid = unsafe { libc::getuid() };
-        let _ = std::process::Command::new("/bin/launchctl")
-            .args(["kickstart", &format!("gui/{uid}/{LABEL}")])
-            .status();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-        while !answering() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(250));
+        #[cfg(target_os = "macos")]
+        {
+            let uid = unsafe { libc::getuid() };
+            let _ = std::process::Command::new("/bin/launchctl")
+                .args(["kickstart", &format!("gui/{uid}/{LABEL}")])
+                .status();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            while !answering() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
         }
     }
     let url = format!("http://127.0.0.1:{port}/phone");
@@ -517,6 +533,7 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 }
 
 #[derive(Subcommand)]
+#[cfg(unix)]
 enum DeviceQuery {
     /// Name, iOS version, model and build (no pairing session needed).
     Info {
@@ -543,6 +560,7 @@ enum DeviceQuery {
 }
 
 /// `iphone-use device …`: one JSON line on stdout, exit 0 / 3 (not attached) / 1.
+#[cfg(unix)]
 fn device_query(query: DeviceQuery) -> i32 {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -628,6 +646,7 @@ fn main() -> Result<()> {
             result
         }
         Command::InstanceContext => instance_context(),
+        #[cfg(unix)]
         Command::Relay {
             udid,
             listen,
@@ -637,6 +656,7 @@ fn main() -> Result<()> {
             .build()
             .context("start the relay runtime")?
             .block_on(server::usbmux::run_relay(&udid, listen, device_port)),
+        #[cfg(unix)]
         Command::Device { query } => std::process::exit(device_query(query)),
         Command::Upgrade { check, json } => std::process::exit(upgrade(check || json, json)),
         Command::Setup { instance, args } => {
@@ -1097,9 +1117,15 @@ struct PidFileContents {
     mode: u32,
 }
 
+#[cfg(unix)]
 fn current_euid() -> u32 {
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
     unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn current_euid() -> u32 {
+    0
 }
 
 /// Read one `ps` field. A missing process is represented as `None`; inability
@@ -1211,6 +1237,7 @@ fn validate_pid_identity(record: &PidRecord, observed: &ProcessIdentity) -> Resu
     Ok(())
 }
 
+#[cfg(unix)]
 fn read_pid_file(path: &std::path::Path) -> std::io::Result<PidFileContents> {
     use std::io::Read as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -1240,9 +1267,33 @@ fn read_pid_file(path: &std::path::Path) -> std::io::Result<PidFileContents> {
     })
 }
 
+#[cfg(not(unix))]
+fn read_pid_file(path: &std::path::Path) -> std::io::Result<PidFileContents> {
+    // Windows has no POSIX owner/mode bits: the runtime dir is already scoped
+    // to one user, and the file's ACL follows from it. Report the expected
+    // mode so the 0600 sanity checks below stay platform-neutral.
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "pid record must be a regular file",
+        ));
+    }
+    let bytes = std::fs::read(path)?;
+    if bytes.len() > 64 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "pid record exceeds 64 KiB",
+        ));
+    }
+    Ok(PidFileContents {
+        bytes,
+        mode: 0o600,
+    })
+}
+
 fn atomic_replace_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let parent = path
@@ -1257,11 +1308,14 @@ fn atomic_replace_private(path: &std::path::Path, contents: &[u8]) -> std::io::R
     for _ in 0..32 {
         let nonce = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let candidate = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), nonce));
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&candidate);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(&candidate);
         match file {
             Ok(file) => {
                 staged = Some((candidate, file));
@@ -1279,12 +1333,29 @@ fn atomic_replace_private(path: &std::path::Path, contents: &[u8]) -> std::io::R
     };
 
     let result = (|| {
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&staged_path, path)?;
-        std::fs::File::open(parent)?.sync_all()?;
+        #[cfg(unix)]
+        {
+            std::fs::rename(&staged_path, path)?;
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows rename refuses to replace an existing file, so clear the
+            // old record first. There are no mode bits here; the per-user
+            // runtime dir scopes the file's ACL.
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+            std::fs::rename(&staged_path, path)?;
+        }
         Ok(())
     })();
     if result.is_err() {
@@ -1409,15 +1480,31 @@ fn stop() -> Result<()> {
     validate_pid_identity(&record, &observed)
         .with_context(|| format!("refusing to signal pid {}", record.pid))?;
 
-    // SAFETY: kill is a simple signal send; we send SIGTERM for a graceful stop.
-    let rc = unsafe { libc::kill(record.pid, libc::SIGTERM) };
-    if rc != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error).with_context(|| format!("send SIGTERM to pid {}", record.pid));
+    #[cfg(unix)]
+    {
+        // SAFETY: kill is a simple signal send; we send SIGTERM for a graceful stop.
+        let rc = unsafe { libc::kill(record.pid, libc::SIGTERM) };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).with_context(|| format!("send SIGTERM to pid {}", record.pid));
+            }
         }
+        eprintln!("sent SIGTERM to verified pid {}", record.pid);
     }
-    eprintln!("sent SIGTERM to verified pid {}", record.pid);
+    #[cfg(windows)]
+    {
+        // No SIGTERM on Windows: taskkill /F terminates the process. Exit code
+        // 128 means "process not found", which plays ESRCH's part.
+        let status = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &record.pid.to_string()])
+            .status()
+            .with_context(|| format!("run taskkill for pid {}", record.pid))?;
+        if !(status.success() || status.code() == Some(128)) {
+            anyhow::bail!("taskkill failed for pid {} ({status})", record.pid);
+        }
+        eprintln!("terminated verified pid {} via taskkill", record.pid);
+    }
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(STOP_WAIT_SECS);
     loop {
@@ -1519,6 +1606,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn generated_session_secret_persists_and_is_reused() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -1538,6 +1626,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn secret_create_race_reads_the_winner() {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -1598,6 +1687,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn ps_identity_snapshot_captures_current_process() {
         let identity = read_process_identity(std::process::id() as i32)
             .unwrap()
@@ -1609,6 +1699,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn atomic_pid_record_is_private() {
         use std::os::unix::fs::PermissionsExt as _;
 

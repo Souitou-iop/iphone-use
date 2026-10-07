@@ -8,7 +8,8 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -25,10 +26,14 @@ use std::path::{Path, PathBuf};
 /// `io::Error` with kind `PermissionDenied` is returned if either check fails.
 pub fn runtime_dir() -> io::Result<PathBuf> {
     let uid = current_uid();
+    // Windows has no $TMPDIR convention; std's temp dir is per-user there.
+    #[cfg(unix)]
     let base = std::env::var("TMPDIR")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/tmp".to_owned());
+    #[cfg(not(unix))]
+    let base = std::env::temp_dir().to_string_lossy().into_owned();
     let dir = PathBuf::from(base).join(dir_name(uid, crate::instance::current()));
     ensure_dir(&dir)?;
     Ok(dir)
@@ -77,9 +82,15 @@ pub(crate) fn ensure_dir(dir: &Path) -> io::Result<()> {
     } else {
         // Create with the correct mode in one step.
         // `std::fs::create_dir` uses umask, so we set mode explicitly via
-        // `std::os::unix::fs::DirBuilder`.
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new().mode(0o700).create(dir)?;
+        // `std::os::unix::fs::DirBuilder`. Windows has no mode bits; the
+        // per-user temp dir scopes the directory's ACL.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().mode(0o700).create(dir)?;
+        }
+        #[cfg(not(unix))]
+        fs::create_dir(dir)?;
         Ok(())
     }
 }
@@ -87,27 +98,39 @@ pub(crate) fn ensure_dir(dir: &Path) -> io::Result<()> {
 /// Validate that `dir` is owned by the current uid and has mode exactly 0700.
 pub(crate) fn validate_dir(dir: &Path) -> io::Result<()> {
     let meta = fs::metadata(dir)?; // follows symlinks — we want the dir itself
-    let uid = current_uid();
-    if meta.uid() != uid {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "runtime dir {:?} is owned by uid {} but current uid is {}",
-                dir,
-                meta.uid(),
-                uid
-            ),
-        ));
+    // Owner and mode checks are Unix-only: Windows has no POSIX uid or mode
+    // bits, and the per-user temp dir already scopes the directory's ACL.
+    #[cfg(unix)]
+    {
+        let uid = current_uid();
+        if meta.uid() != uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "runtime dir {:?} is owned by uid {} but current uid is {}",
+                    dir,
+                    meta.uid(),
+                    uid
+                ),
+            ));
+        }
+        // Mode bits: mask off the file-type bits, keep only the permission bits.
+        let mode = meta.mode() & 0o7777;
+        if mode != 0o700 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "runtime dir {:?} has mode {:04o} but expected 0700",
+                    dir, mode
+                ),
+            ));
+        }
     }
-    // Mode bits: mask off the file-type bits, keep only the permission bits.
-    let mode = meta.mode() & 0o7777;
-    if mode != 0o700 {
+    #[cfg(not(unix))]
+    if !meta.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!(
-                "runtime dir {:?} has mode {:04o} but expected 0700",
-                dir, mode
-            ),
+            format!("runtime dir {:?} is not a directory", dir),
         ));
     }
     Ok(())
@@ -118,14 +141,19 @@ pub(crate) fn validate_dir(dir: &Path) -> io::Result<()> {
 pub(crate) fn write_secret_in(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     let path = dir.join(name);
     // O_NOFOLLOW: reject the open if the final path component is a symlink.
-    // O_EXCL:     fail if the file already exists.
-    let custom = libc::O_NOFOLLOW | libc::O_EXCL;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true) // implies O_CREAT | O_EXCL
-        .mode(0o600)
-        .custom_flags(custom) // i32 from libc constants
-        .open(&path)?;
+    // O_EXCL:     fail if the file already exists (create_new implies it too).
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true) // implies O_CREAT | O_EXCL
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_EXCL) // i32 from libc constants
+            .open(&path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&path)?;
     file.write_all(bytes)?;
     Ok(())
 }
@@ -142,52 +170,68 @@ pub(crate) fn read_secret_in(dir: &Path, name: &str) -> io::Result<Vec<u8>> {
             format!("secret file {:?} is not a regular file", path),
         ));
     }
-    let uid = current_uid();
-    if meta.uid() != uid {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "secret file {:?} is owned by uid {} but current uid is {}",
-                path,
-                meta.uid(),
-                uid
-            ),
-        ));
-    }
-    let mode = meta.mode() & 0o7777;
-    if mode != 0o600 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "secret file {:?} has mode {:04o} but expected 0600",
-                path, mode
-            ),
-        ));
+    // Owner and mode checks are Unix-only (see `validate_dir`).
+    #[cfg(unix)]
+    {
+        let uid = current_uid();
+        if meta.uid() != uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "secret file {:?} is owned by uid {} but current uid is {}",
+                    path,
+                    meta.uid(),
+                    uid
+                ),
+            ));
+        }
+        let mode = meta.mode() & 0o7777;
+        if mode != 0o600 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "secret file {:?} has mode {:04o} but expected 0600",
+                    path, mode
+                ),
+            ));
+        }
     }
 
     // Open with O_NOFOLLOW so the OS also rejects a symlink (belt-and-suspenders).
-    let custom = libc::O_NOFOLLOW;
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(custom) // i32 from libc
-        .open(&path)?;
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW) // i32 from libc
+            .open(&path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = OpenOptions::new().read(true).open(&path)?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
     Ok(buf)
 }
 
-/// Return the effective UID of the current process.
+/// Return the effective UID of the current process (0 on platforms without a
+/// POSIX uid).
+#[cfg(unix)]
 fn current_uid() -> u32 {
     // SAFETY: `geteuid` takes no arguments, has no preconditions, and always
     // succeeds.
     unsafe { libc::geteuid() }
 }
 
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

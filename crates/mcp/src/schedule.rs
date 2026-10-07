@@ -29,7 +29,12 @@ fn when(unix: Option<u64>) -> String {
     // Local wall time without pulling in a date crate.
     let t = unix as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: localtime_r (localtime_s on Windows, with swapped arguments)
+    // writes only into `tm`, which we own.
+    #[cfg(unix)]
     unsafe { libc::localtime_r(&t, &mut tm) };
+    #[cfg(windows)]
+    unsafe { libc::localtime_s(&mut tm, &t) };
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}",
         tm.tm_year + 1900,

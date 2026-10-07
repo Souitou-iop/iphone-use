@@ -272,10 +272,15 @@ pub fn read_fixture(key: &str) -> Result<Option<BTreeMap<String, String>>> {
 }
 
 pub fn write_fixture(key: &str, shape: &BTreeMap<String, String>) -> Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let path = fixture_path(key)?;
     if let Some(dir) = path.parent() {
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(dir)?;
     }
     let body = serde_json::to_vec_pretty(&serde_json::json!({
         "flow": key,
@@ -285,15 +290,26 @@ pub fn write_fixture(key: &str, shape: &BTreeMap<String, String>) -> Result<Path
     let tmp = path.with_extension("json.tmp");
     {
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
         file.write_all(&body)?;
     }
+    #[cfg(unix)]
     std::fs::rename(&tmp, &path)?;
+    #[cfg(not(unix))]
+    {
+        // Windows rename refuses to replace an existing file.
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        std::fs::rename(&tmp, &path)?;
+    }
     Ok(path)
 }
 

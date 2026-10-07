@@ -551,22 +551,32 @@ pub fn slug(name: &str) -> String {
 }
 
 fn private_dir(path: &Path) -> Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-        .with_context(|| format!("create artifacts directory {}", path.display()))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .with_context(|| format!("create artifacts directory {}", path.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("create artifacts directory {}", path.display()))
+    }
 }
 
 fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(path)
         .with_context(|| format!("write {}", path.display()))?;
     file.write_all(bytes)?;
@@ -1085,6 +1095,7 @@ cases:
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_failed_assert_fails_its_case_saves_evidence_and_the_next_case_still_runs() {
         let (url, seen) = path_daemon();
         let daemon = DaemonClient::new(url, None);

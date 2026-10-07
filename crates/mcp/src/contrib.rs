@@ -1051,6 +1051,7 @@ mod tests {
 
     /// End-to-end publish against a local bare repo with a stub `gh`.
     #[test]
+    #[cfg(unix)]
     fn publish_pushes_a_branch_and_opens_a_pr_through_gh() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
