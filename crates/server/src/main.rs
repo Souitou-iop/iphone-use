@@ -42,8 +42,8 @@ const STARTUP_BACKOFF_SECS: u64 = 30;
 /// (stderr redirected to the log file), where a fast crash-relaunch loop is
 /// harmful — see the backoff in [`main`].
 fn stderr_is_tty() -> bool {
-    // SAFETY: `isatty` is a pure libc query on a fixed fd, no memory effects.
-    unsafe { libc::isatty(libc::STDERR_FILENO) == 1 }
+    use std::io::IsTerminal as _;
+    std::io::stderr().is_terminal()
 }
 
 fn endpoint_is_loopback(value: &str) -> bool {
