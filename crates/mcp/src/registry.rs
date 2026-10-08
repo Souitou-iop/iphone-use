@@ -21,12 +21,12 @@
 //! locally with `flow add`, so an update never deletes a user's own flows.
 
 use crate::flow::{self, FlowMeta};
+use crate::platform::{DirBuilderExt, OpenOptionsExt};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 pub const OFFICIAL_SOURCE_NAME: &str = "official";
@@ -460,7 +460,7 @@ fn write_private_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(crate::platform::O_NOFOLLOW)
             .open(&tmp)
             .with_context(|| format!("create {}", tmp.display()))?;
         file.write_all(bytes)

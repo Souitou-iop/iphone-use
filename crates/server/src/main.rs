@@ -135,9 +135,7 @@ fn wda_management_pending(
     target_udid: Option<&str>,
     configured: Option<bool>,
 ) -> bool {
-    endpoints_are_local
-        && target_udid.is_none()
-        && configured != Some(false)
+    endpoints_are_local && target_udid.is_none() && configured != Some(false)
 }
 
 #[derive(Parser)]
@@ -289,12 +287,25 @@ fn update_notice() {
 }
 
 /// Is `program` an executable somewhere on `$PATH`?
+#[cfg(unix)]
 fn on_path(program: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path).any(|dir| {
             std::fs::metadata(dir.join(program))
                 .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
+/// Windows has no execute bit; a program is `name.exe` / `.cmd` / `.bat`.
+#[cfg(windows)]
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            ["exe", "cmd", "bat"]
+                .iter()
+                .any(|ext| dir.join(format!("{program}.{ext}")).is_file())
         })
     })
 }
@@ -349,10 +360,7 @@ fn upgrade(check_only: bool, json: bool) -> i32 {
         update::record_check(&path, update::unix_now(), fetched.as_deref().ok());
     }
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let skills = home
-        .as_deref()
-        .map(update::find_skills)
-        .unwrap_or_default();
+    let skills = home.as_deref().map(update::find_skills).unwrap_or_default();
     let report = update::UpgradeReport::new(current, &fetched, skills);
 
     if json {
@@ -425,7 +433,8 @@ fn upgrade(check_only: bool, json: bool) -> i32 {
 
 /// `iphone-use instance-context`: the derived instance as one JSON object.
 fn instance_context() -> Result<()> {
-    let instance = server::instance::Instance::from_env().map_err(|error| anyhow::anyhow!(error))?;
+    let instance =
+        server::instance::Instance::from_env().map_err(|error| anyhow::anyhow!(error))?;
     let udid = std::env::var("PHONE_REMOTE_UDID")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -458,6 +467,7 @@ fn open_console() -> Result<()> {
     let answering = || {
         std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok()
     };
+    #[cfg(unix)]
     if !answering() {
         let uid = unsafe { libc::getuid() };
         let _ = std::process::Command::new("/bin/launchctl")
@@ -474,21 +484,35 @@ fn open_console() -> Result<()> {
             "iphone-use 服务没有运行（127.0.0.1:{port} 无响应）。请重新运行安装命令：\ncurl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh"
         );
         eprintln!("{message}");
+        #[cfg(target_os = "macos")]
         let script = format!(
             "display alert \"iPhone Use\" message \"{}\" as critical",
             message.replace('\\', "\\\\").replace('"', "\\\"")
         );
+        #[cfg(target_os = "macos")]
         let _ = std::process::Command::new("/usr/bin/osascript")
             .args(["-e", &script])
             .status();
         anyhow::bail!("service not answering on {addr}");
     }
     eprintln!("opening {url}");
-    std::process::Command::new("/usr/bin/open")
-        .arg(&url)
-        .status()
-        .context("open the control page")?;
+    open_url(&url).context("open the control page")?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_url(url: &str) -> std::io::Result<std::process::ExitStatus> {
+    std::process::Command::new("/usr/bin/open")
+        .arg(url)
+        .status()
+}
+
+#[cfg(windows)]
+fn open_url(url: &str) -> std::io::Result<std::process::ExitStatus> {
+    // `start` treats its first quoted argument as a window title.
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .status()
 }
 
 /// One value from the installed LaunchAgent's EnvironmentVariables, which a
@@ -513,7 +537,7 @@ fn launch_agent_env(label: &str, key: &str) -> Option<String> {
 }
 
 fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
+    server::platform::home_dir()
 }
 
 #[derive(Subcommand)]
@@ -602,6 +626,7 @@ fn device_query(query: DeviceQuery) -> i32 {
 }
 
 fn main() -> Result<()> {
+    server::platform::ensure_home();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -744,7 +769,13 @@ fn serve() -> Result<()> {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "http://127.0.0.1:9100".to_string());
     let endpoints_are_local = endpoint_is_loopback(&wda_url) && endpoint_is_loopback(&mjpeg_url);
-    let managed_setting = optional_env_bool("PHONE_REMOTE_WDA_MANAGED")?;
+    // Windows has no setup-wda.sh supervisor to hand the runner back to: the
+    // runner is started outside the daemon (scripts/windows/iphone-use.ps1).
+    let managed_setting = optional_env_bool("PHONE_REMOTE_WDA_MANAGED")?.or(if cfg!(windows) {
+        Some(false)
+    } else {
+        None
+    });
     let managed_wda_pending = wda_management_pending(
         endpoints_are_local,
         cfg.device_udid.as_deref(),
@@ -1098,12 +1129,12 @@ struct PidFileContents {
 }
 
 fn current_euid() -> u32 {
-    // SAFETY: geteuid has no preconditions and does not dereference pointers.
-    unsafe { libc::geteuid() }
+    server::platform::euid()
 }
 
 /// Read one `ps` field. A missing process is represented as `None`; inability
 /// to execute or decode `/bin/ps` is an error so callers fail closed.
+#[cfg(unix)]
 fn ps_field(pid: i32, field: &str) -> Result<Option<String>> {
     if pid <= 1 {
         anyhow::bail!("refusing unsafe pid {pid}");
@@ -1136,6 +1167,7 @@ fn ps_field(pid: i32, field: &str) -> Result<Option<String>> {
 /// Snapshot the fields used to distinguish the daemon from a reused or
 /// attacker-selected pid. Reading `lstart` both before and after the other
 /// fields avoids accepting a mixed snapshot if the pid changes mid-query.
+#[cfg(unix)]
 fn read_process_identity(pid: i32) -> Result<Option<ProcessIdentity>> {
     let Some(started_at) = ps_field(pid, "lstart")? else {
         return Ok(None);
@@ -1164,6 +1196,89 @@ fn read_process_identity(pid: i32) -> Result<Option<ProcessIdentity>> {
         executable,
         argv,
     }))
+}
+
+/// Windows: the same identity from the process handle (creation time and
+/// image path). Another process's command line is not readable without
+/// undocumented calls, so `argv` repeats the image path; the start time is
+/// what tells a reused pid apart. Windows has no uid; [`current_euid`] is 0.
+#[cfg(windows)]
+fn read_process_identity(pid: i32) -> Result<Option<ProcessIdentity>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid <= 1 {
+        anyhow::bail!("refusing unsafe pid {pid}");
+    }
+    // SAFETY: plain Win32 calls on a handle we open and close here; every
+    // out-pointer refers to a local that outlives the call.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if handle.is_null() {
+            return Ok(None);
+        }
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        let mut path = [0u16; 1024];
+        let mut len = path.len() as u32;
+        let times = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
+        let named = QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut len);
+        CloseHandle(handle);
+        if times == 0 || named == 0 {
+            return Ok(None);
+        }
+        let started = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+        let executable = String::from_utf16_lossy(&path[..len as usize]);
+        Ok(Some(ProcessIdentity {
+            euid: current_euid(),
+            started_at: started.to_string(),
+            argv: executable.clone(),
+            executable,
+        }))
+    }
+}
+
+/// Ask `pid` to stop: SIGTERM on Unix; on Windows, which has no signal a
+/// console process can be sent from outside, terminate it.
+#[cfg(unix)]
+fn terminate(pid: i32) -> Result<()> {
+    // SAFETY: kill is a simple signal send; we send SIGTERM for a graceful stop.
+    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if rc != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).with_context(|| format!("send SIGTERM to pid {pid}"));
+        }
+    }
+    eprintln!("sent SIGTERM to verified pid {pid}");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn terminate(pid: i32) -> Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    // SAFETY: a handle we open and close here.
+    let ok = unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid as u32);
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("open pid {pid} to stop it"));
+        }
+        let ok = TerminateProcess(handle, 0);
+        CloseHandle(handle);
+        ok
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("terminate pid {pid}"));
+    }
+    eprintln!("terminated verified pid {pid}");
+    Ok(())
 }
 
 fn parse_pid_record(bytes: &[u8]) -> Result<ParsedPidRecord> {
@@ -1212,15 +1327,25 @@ fn validate_pid_identity(record: &PidRecord, observed: &ProcessIdentity) -> Resu
 }
 
 fn read_pid_file(path: &std::path::Path) -> std::io::Result<PidFileContents> {
+    use server::platform::OpenOptionsExt as _;
     use std::io::Read as _;
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
+    if path.symlink_metadata()?.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "pid record must not be a symlink",
+        ));
+    }
     let mut file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(server::platform::O_NOFOLLOW)
         .open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.file_type().is_file() || metadata.uid() != current_euid() {
+    #[cfg(unix)]
+    let owned = std::os::unix::fs::MetadataExt::uid(&metadata) == current_euid();
+    #[cfg(windows)]
+    let owned = true;
+    if !metadata.file_type().is_file() || !owned {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "pid record must be a regular file owned by the current uid",
@@ -1234,15 +1359,17 @@ fn read_pid_file(path: &std::path::Path) -> std::io::Result<PidFileContents> {
             "pid record exceeds 64 KiB",
         ));
     }
-    Ok(PidFileContents {
-        bytes,
-        mode: metadata.mode() & 0o777,
-    })
+    #[cfg(unix)]
+    let mode = std::os::unix::fs::MetadataExt::mode(&metadata) & 0o777;
+    // No mode bits on Windows; the profile directory's ACL is the guard.
+    #[cfg(windows)]
+    let mode = 0o600;
+    Ok(PidFileContents { bytes, mode })
 }
 
 fn atomic_replace_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use server::platform::OpenOptionsExt as _;
     use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let parent = path
@@ -1279,11 +1406,14 @@ fn atomic_replace_private(path: &std::path::Path, contents: &[u8]) -> std::io::R
     };
 
     let result = (|| {
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        #[cfg(unix)]
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
         std::fs::rename(&staged_path, path)?;
+        // Windows cannot open a directory as a file to flush it.
+        #[cfg(unix)]
         std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     })();
@@ -1409,15 +1539,7 @@ fn stop() -> Result<()> {
     validate_pid_identity(&record, &observed)
         .with_context(|| format!("refusing to signal pid {}", record.pid))?;
 
-    // SAFETY: kill is a simple signal send; we send SIGTERM for a graceful stop.
-    let rc = unsafe { libc::kill(record.pid, libc::SIGTERM) };
-    if rc != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error).with_context(|| format!("send SIGTERM to pid {}", record.pid));
-        }
-    }
-    eprintln!("sent SIGTERM to verified pid {}", record.pid);
+    terminate(record.pid)?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(STOP_WAIT_SECS);
     loop {

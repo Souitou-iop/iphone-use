@@ -119,6 +119,7 @@ WebDriverAgent 的版本是 4.2 秒。实时画面 27–28 fps。每台手机有
 
 ## 更多
 
+- [Windows（实验性）](docs/windows.zh-CN.md)：在 Windows 上原生运行守护进程和 MCP，用 go-ios 启动 runner。
 - [完整指南](docs/guide.zh-CN.md)：网页和 iOS App、flow 与官方 flow 源、生命周期、配置、安全、开发。
 - [Agent API 参考](docs/agent-api.html) · [MCP 工具](crates/mcp/README.md) · [架构](docs/direct-device-architecture.html) · [设备设置常见坑](docs/wda-setup.html) · [设备 runner](runner/README.md)
 - 安全只说一句：密码只保护 44321 端口，手机上 runner 自己的端口没有鉴权，只在可信网络里用（[详情](docs/guide.zh-CN.md#安全)）。

@@ -272,7 +272,7 @@ pub fn read_fixture(key: &str) -> Result<Option<BTreeMap<String, String>>> {
 }
 
 pub fn write_fixture(key: &str, shape: &BTreeMap<String, String>) -> Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use crate::platform::{DirBuilderExt, OpenOptionsExt};
     let path = fixture_path(key)?;
     if let Some(dir) = path.parent() {
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;

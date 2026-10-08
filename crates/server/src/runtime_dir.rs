@@ -6,9 +6,11 @@
 //! an adversary who controls other paths under `/tmp` cannot trick the process
 //! into reading or writing their files.
 
+use crate::platform::OpenOptionsExt as _;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -25,13 +27,24 @@ use std::path::{Path, PathBuf};
 /// `io::Error` with kind `PermissionDenied` is returned if either check fails.
 pub fn runtime_dir() -> io::Result<PathBuf> {
     let uid = current_uid();
+    let dir = temp_base().join(dir_name(uid, crate::instance::current()));
+    ensure_dir(&dir)?;
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn temp_base() -> PathBuf {
     let base = std::env::var("TMPDIR")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/tmp".to_owned());
-    let dir = PathBuf::from(base).join(dir_name(uid, crate::instance::current()));
-    ensure_dir(&dir)?;
-    Ok(dir)
+    PathBuf::from(base)
+}
+
+/// `%TEMP%`, which sits under the user's profile.
+#[cfg(windows)]
+fn temp_base() -> PathBuf {
+    std::env::temp_dir()
 }
 
 /// The pid record and session secret are per daemon: a named instance (#67)
@@ -78,13 +91,28 @@ pub(crate) fn ensure_dir(dir: &Path) -> io::Result<()> {
         // Create with the correct mode in one step.
         // `std::fs::create_dir` uses umask, so we set mode explicitly via
         // `std::os::unix::fs::DirBuilder`.
-        use std::os::unix::fs::DirBuilderExt;
+        use crate::platform::DirBuilderExt as _;
         fs::DirBuilder::new().mode(0o700).create(dir)?;
         Ok(())
     }
 }
 
 /// Validate that `dir` is owned by the current uid and has mode exactly 0700.
+///
+/// Windows has neither, so there it only checks that `dir` is a directory.
+#[cfg(windows)]
+pub(crate) fn validate_dir(dir: &Path) -> io::Result<()> {
+    if fs::metadata(dir)?.is_dir() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("runtime dir {:?} is not a directory", dir),
+        ))
+    }
+}
+
+#[cfg(unix)]
 pub(crate) fn validate_dir(dir: &Path) -> io::Result<()> {
     let meta = fs::metadata(dir)?; // follows symlinks — we want the dir itself
     let uid = current_uid();
@@ -119,7 +147,10 @@ pub(crate) fn write_secret_in(dir: &Path, name: &str, bytes: &[u8]) -> io::Resul
     let path = dir.join(name);
     // O_NOFOLLOW: reject the open if the final path component is a symlink.
     // O_EXCL:     fail if the file already exists.
+    #[cfg(unix)]
     let custom = libc::O_NOFOLLOW | libc::O_EXCL;
+    #[cfg(windows)]
+    let custom = 0;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true) // implies O_CREAT | O_EXCL
@@ -142,6 +173,22 @@ pub(crate) fn read_secret_in(dir: &Path, name: &str) -> io::Result<Vec<u8>> {
             format!("secret file {:?} is not a regular file", path),
         ));
     }
+    #[cfg(unix)]
+    check_secret_owner_and_mode(&path, &meta)?;
+
+    // Open with O_NOFOLLOW so the OS also rejects a symlink (belt-and-suspenders).
+    let custom = crate::platform::O_NOFOLLOW;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(custom) // i32 from libc
+        .open(&path)?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+#[cfg(unix)]
+fn check_secret_owner_and_mode(path: &Path, meta: &fs::Metadata) -> io::Result<()> {
     let uid = current_uid();
     if meta.uid() != uid {
         return Err(io::Error::new(
@@ -164,23 +211,12 @@ pub(crate) fn read_secret_in(dir: &Path, name: &str) -> io::Result<Vec<u8>> {
             ),
         ));
     }
-
-    // Open with O_NOFOLLOW so the OS also rejects a symlink (belt-and-suspenders).
-    let custom = libc::O_NOFOLLOW;
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(custom) // i32 from libc
-        .open(&path)?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-    Ok(buf)
+    Ok(())
 }
 
 /// Return the effective UID of the current process.
 fn current_uid() -> u32 {
-    // SAFETY: `geteuid` takes no arguments, has no preconditions, and always
-    // succeeds.
-    unsafe { libc::geteuid() }
+    crate::platform::euid()
 }
 
 // ---------------------------------------------------------------------------

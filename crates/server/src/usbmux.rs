@@ -1,5 +1,8 @@
-//! Loopback TCP relay to a port on a USB-connected iPhone, through macOS's
-//! own usbmuxd (`/var/run/usbmuxd`).
+//! Loopback TCP relay to a port on a USB-connected iPhone, through the
+//! system's usbmuxd: macOS's own (`/var/run/usbmuxd`), or on Windows the
+//! Apple Mobile Device Service that iTunes / Apple Devices installs
+//! (`127.0.0.1:27015`). `USBMUXD_SOCKET_ADDRESS` overrides either, the same
+//! variable libimobiledevice reads (`host:port` for TCP, otherwise a path).
 //!
 //! This replaces libimobiledevice's `iproxy` for the runner's control and
 //! video relays, so a user no longer needs Homebrew or libimobiledevice. Each
@@ -14,10 +17,13 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
+#[cfg(unix)]
 const USBMUXD_SOCKET: &str = "/var/run/usbmuxd";
+#[cfg(windows)]
+const USBMUXD_SOCKET: &str = "127.0.0.1:27015";
 const HEADER_LEN: usize = 16;
 const PLIST_MESSAGE: u32 = 8;
 const PROTOCOL_VERSION: u32 = 1;
@@ -77,6 +83,41 @@ async fn forward(mut client: TcpStream, want: &str, device_port: u16) -> Result<
     Ok(())
 }
 
+/// A connection to usbmuxd; after a successful `Connect` it is the raw
+/// tunnel to the device port.
+pub(crate) trait MuxIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> MuxIo for T {}
+pub(crate) type MuxStream = Box<dyn MuxIo>;
+
+/// Where usbmuxd listens: `USBMUXD_SOCKET_ADDRESS`, else the platform default.
+fn mux_address() -> String {
+    std::env::var("USBMUXD_SOCKET_ADDRESS")
+        .ok()
+        .map(|value| value.trim().trim_start_matches("UNIX:").to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| USBMUXD_SOCKET.to_string())
+}
+
+async fn open_mux() -> Result<MuxStream> {
+    let address = mux_address();
+    if let Ok(tcp) = address.parse::<SocketAddr>() {
+        let stream = TcpStream::connect(tcp).await.with_context(|| {
+            format!("connect usbmuxd at {address} (is Apple Mobile Device Service running?)")
+        })?;
+        let _ = stream.set_nodelay(true);
+        return Ok(Box::new(stream));
+    }
+    #[cfg(unix)]
+    {
+        let stream = tokio::net::UnixStream::connect(&address)
+            .await
+            .with_context(|| format!("connect {address}"))?;
+        Ok(Box::new(stream))
+    }
+    #[cfg(not(unix))]
+    bail!("usbmuxd address {address} is not host:port")
+}
+
 /// The usbmux device id for `want` (a normalized UDID), preferring a USB
 /// attachment over a network one.
 async fn find_device(want: &str) -> Result<Option<u64>> {
@@ -97,19 +138,35 @@ pub(crate) struct Attached {
 /// `want` (a normalized UDID) as usbmuxd currently lists it, preferring a USB
 /// attachment over a network one.
 pub(crate) async fn find_attached(want: &str) -> Result<Option<Attached>> {
-    let mut mux = UnixStream::connect(USBMUXD_SOCKET)
-        .await
-        .context("connect /var/run/usbmuxd")?;
+    let mut mux = open_mux().await?;
     let reply = request(&mut mux, &list_devices_message()).await?;
     Ok(pick_attached(&reply, want))
 }
 
 /// The pairing record usbmuxd keeps for `serial` (the plist bytes of
-/// `/var/db/lockdown/<udid>.plist`, which only root can read directly).
+/// `/var/db/lockdown/<udid>.plist`, which only root can read directly; on
+/// Windows `%ProgramData%\Apple\Lockdown\<udid>.plist`).
 pub(crate) async fn read_pair_record(serial: &str) -> Result<Vec<u8>> {
-    let mut mux = UnixStream::connect(USBMUXD_SOCKET)
-        .await
-        .context("connect /var/run/usbmuxd")?;
+    let from_mux = read_pair_record_from_mux(serial).await;
+    #[cfg(windows)]
+    if from_mux.is_err() {
+        // Older Apple Mobile Device Service builds do not answer
+        // ReadPairRecord; the record is a readable file for the user there.
+        if let Some(dir) = std::env::var_os("ProgramData") {
+            let path = std::path::Path::new(&dir)
+                .join("Apple")
+                .join("Lockdown")
+                .join(format!("{serial}.plist"));
+            if let Ok(bytes) = tokio::fs::read(&path).await {
+                return Ok(bytes);
+            }
+        }
+    }
+    from_mux
+}
+
+async fn read_pair_record_from_mux(serial: &str) -> Result<Vec<u8>> {
+    let mut mux = open_mux().await?;
     let reply = request(&mut mux, &read_pair_record_message(serial)).await?;
     match reply.get("PairRecordData") {
         Some(Value::Data(bytes)) => Ok(bytes.clone()),
@@ -122,10 +179,8 @@ pub(crate) async fn read_pair_record(serial: &str) -> Result<Vec<u8>> {
 
 /// Ask usbmuxd to tunnel to `port` on `device_id`; the returned stream is the
 /// tunnel once usbmuxd has answered `Result 0`.
-pub(crate) async fn connect(device_id: u64, port: u16) -> Result<UnixStream> {
-    let mut mux = UnixStream::connect(USBMUXD_SOCKET)
-        .await
-        .context("connect /var/run/usbmuxd")?;
+pub(crate) async fn connect(device_id: u64, port: u16) -> Result<MuxStream> {
+    let mut mux = open_mux().await?;
     let reply = request(&mut mux, &connect_message(device_id, port)).await?;
     match reply.get("Number").and_then(Value::as_int) {
         Some(0) => Ok(mux),
@@ -135,7 +190,7 @@ pub(crate) async fn connect(device_id: u64, port: u16) -> Result<UnixStream> {
     }
 }
 
-async fn request(mux: &mut UnixStream, body: &str) -> Result<Value> {
+async fn request(mux: &mut MuxStream, body: &str) -> Result<Value> {
     tokio::time::timeout(MUX_TIMEOUT, async {
         mux.write_all(&frame(body, 1)).await?;
         let mut header = [0u8; HEADER_LEN];

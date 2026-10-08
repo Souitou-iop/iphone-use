@@ -551,7 +551,7 @@ pub fn slug(name: &str) -> String {
 }
 
 fn private_dir(path: &Path) -> Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
+    use crate::platform::DirBuilderExt;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -560,8 +560,8 @@ fn private_dir(path: &Path) -> Result<()> {
 }
 
 fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    use crate::platform::OpenOptionsExt;
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)

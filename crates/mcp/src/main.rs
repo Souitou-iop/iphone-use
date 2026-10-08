@@ -33,6 +33,7 @@ mod contrib;
 mod flow;
 mod jev;
 mod outputs;
+mod platform;
 mod registry;
 mod schedule;
 mod server;
@@ -297,6 +298,9 @@ enum FlowCommand {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Only acts on Windows, where HOME is normally unset; setting it there is
+    // thread-safe.
+    platform::ensure_home();
     let cli = Cli::parse();
 
     // Log to stderr so it does not interfere with the MCP stdio protocol on
