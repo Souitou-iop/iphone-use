@@ -6,6 +6,7 @@ pub mod http;
 pub mod instance;
 pub mod lockdown;
 pub mod pairing;
+pub mod platform;
 pub mod protocol;
 pub mod redaction;
 pub mod runtime_dir;

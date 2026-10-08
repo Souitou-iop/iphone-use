@@ -1,0 +1,143 @@
+name: Windows
+
+# Native Windows build (daemon + MCP bridge) and the unsigned runner IPA that
+# Windows users sign and install themselves (docs/windows.md). On a version tag
+# both are attached to the release the macOS workflow creates.
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+concurrency:
+  group: >-
+    windows-${{ github.event.pull_request.number
+      || format('{0}-{1}', github.event.pull_request.head.repo.full_name || github.repository, github.ref) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows x64 binaries
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: always
+      PHONE_REMOTE_URL: http://127.0.0.1:1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --bin iphone-use --bin iphone-use-mcp
+
+      - name: Smoke test (CLI and MCP tools/list)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/iphone-use.exe --version
+          ./target/release/iphone-use.exe instance-context
+          ./target/release/iphone-use-mcp.exe flow validate examples/flows/open-spotlight.json
+          python - <<'PY'
+          import json, subprocess
+          requests = "\n".join([
+              json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                  "protocolVersion": "2025-06-18", "capabilities": {},
+                  "clientInfo": {"name": "windows-ci", "version": "0"}}}),
+              json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+              json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+              "",
+          ])
+          out = subprocess.run(["target/release/iphone-use-mcp.exe"], input=requests,
+                               text=True, encoding="utf-8", capture_output=True,
+                               timeout=60, check=True)
+          responses = [json.loads(l) for l in out.stdout.splitlines() if l.strip()]
+          tools = next(r for r in responses if r.get("id") == 2)["result"]["tools"]
+          assert len(tools) == 23, [t["name"] for t in tools]
+          print(f"MCP exposes {len(tools)} tools on Windows")
+          PY
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = "iphone-use-windows-x64"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target/release/iphone-use.exe, target/release/iphone-use-mcp.exe $dir
+          Copy-Item scripts/windows/iphone-use.ps1, docs/windows.md, docs/windows.zh-CN.md, LICENSE $dir
+          Compress-Archive -Path "$dir/*" -DestinationPath "$dir.zip" -Force
+          (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash.ToLower() + "  $dir.zip" | Out-File -Encoding ascii "$dir.zip.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: iphone-use-windows-x64
+          path: |
+            iphone-use-windows-x64.zip
+            iphone-use-windows-x64.zip.sha256
+          retention-days: 14
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            iphone-use-windows-x64.zip
+            iphone-use-windows-x64.zip.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  runner-ipa:
+    name: Unsigned runner IPA
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # The same unsigned build-for-testing runner/ci-check.sh compiles,
+      # packaged as an IPA a Windows user re-signs (Sideloadly, or
+      # `ios ui install` with their own certificate and profile).
+      - name: Build and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          IPU_RUNNER_UNSIGNED=1 bash runner/build.sh >/dev/null
+          app="$(find runner/build/DerivedData/Build/Products -maxdepth 2 -name 'iPhoneUse-Runner.app' -type d | head -1)"
+          test -n "$app"
+          test -d "$app/PlugIns/iPhoneUse.xctest"
+          rm -rf Payload && mkdir Payload
+          cp -R "$app" Payload/
+          zip -qry iPhoneUse-Runner-unsigned.ipa Payload
+          shasum -a 256 iPhoneUse-Runner-unsigned.ipa > iPhoneUse-Runner-unsigned.ipa.sha256
+          cat iPhoneUse-Runner-unsigned.ipa.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: iPhoneUse-Runner-unsigned-ipa
+          path: |
+            iPhoneUse-Runner-unsigned.ipa
+            iPhoneUse-Runner-unsigned.ipa.sha256
+          retention-days: 14
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            iPhoneUse-Runner-unsigned.ipa
+            iPhoneUse-Runner-unsigned.ipa.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

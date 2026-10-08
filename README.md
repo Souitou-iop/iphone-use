@@ -144,6 +144,8 @@ the same time run as fast as either one alone.
 
 ## More
 
+- [Windows (experimental)](docs/windows.md): run the daemon and MCP bridge natively on
+  Windows, with go-ios starting the runner.
 - [Full guide](docs/guide.md): browser and iOS app, flows and the flow registry,
   lifecycle, configuration, security, development.
 - [Agent API reference](docs/agent-api.html) · [MCP tools](crates/mcp/README.md) ·

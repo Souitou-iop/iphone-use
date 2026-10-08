@@ -27,9 +27,7 @@ fn when(unix: Option<u64>) -> String {
         return "—".into();
     };
     // Local wall time without pulling in a date crate.
-    let t = unix as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&t, &mut tm) };
+    let tm = crate::platform::local_tm(unix);
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}",
         tm.tm_year + 1900,

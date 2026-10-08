@@ -709,7 +709,9 @@ pub fn store_is_stale() -> bool {
 /// alike). The daemon never reimplements fetching and verification.
 pub fn mcp_binary() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let candidate = exe.parent()?.join("iphone-use-mcp");
+    let candidate = exe
+        .parent()?
+        .join(format!("iphone-use-mcp{}", std::env::consts::EXE_SUFFIX));
     candidate.is_file().then_some(candidate)
 }
 

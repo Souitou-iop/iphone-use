@@ -71,6 +71,12 @@ objc2-core-media = "0.3.2"
 objc2-core-video = "0.3.2"
 objc2-video-toolbox = "0.3.2"
 
+# Windows: the LAN addresses the pairing page offers (getifaddrs on Unix).
+[target.'cfg(windows)'.dependencies]
+if-addrs = "0.13"
+# Windows: identify and stop the recorded daemon process (ps/kill on Unix).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

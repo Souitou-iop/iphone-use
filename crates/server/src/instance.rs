@@ -91,7 +91,6 @@ impl Instance {
     /// someone other than the owner of HOME. A missing directory is fine —
     /// the helper creates it.
     pub fn verify_on_disk(&self) -> Result<(), String> {
-        use std::os::unix::fs::MetadataExt as _;
         let dir = &self.state_dir;
         let Ok(meta) = std::fs::symlink_metadata(dir) else {
             return Ok(());
@@ -118,7 +117,10 @@ impl Instance {
                 canonical.display()
             ));
         }
+        // Windows has no uid; the profile directory's ACL covers this there.
+        #[cfg(unix)]
         if let Ok(home_meta) = std::fs::metadata(&self.home) {
+            use std::os::unix::fs::MetadataExt as _;
             if home_meta.uid() != meta.uid() {
                 return Err(format!(
                     "state dir {} is owned by uid {} but HOME by uid {}; refusing to use it",

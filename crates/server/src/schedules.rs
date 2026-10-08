@@ -40,10 +40,7 @@ pub struct LocalTime {
 
 /// The system's local time for a unix timestamp.
 pub fn local_time(unix: u64) -> LocalTime {
-    let t = unix as libc::time_t;
-    // SAFETY: localtime_r writes only into `tm`, which we own.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&t, &mut tm) };
+    let tm = crate::platform::local_tm(unix);
     LocalTime {
         minute: tm.tm_min as u32,
         hour: tm.tm_hour as u32,
@@ -613,8 +610,8 @@ fn read_store(path: &Path) -> Store {
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use crate::platform::OpenOptionsExt as _;
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("json.tmp");
     {
         let mut file = std::fs::OpenOptions::new()
@@ -1126,7 +1123,7 @@ impl Scheduler {
         let started = self.now();
         let artifacts = self.config.artifacts_dir.join(&run.id);
         {
-            use std::os::unix::fs::DirBuilderExt;
+            use crate::platform::DirBuilderExt as _;
             let _ = std::fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)

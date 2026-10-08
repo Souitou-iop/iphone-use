@@ -126,6 +126,19 @@ pub fn lan_addresses() -> Vec<(String, Ipv4Addr)> {
     found
 }
 
+#[cfg(windows)]
+fn interface_ipv4s() -> Vec<(String, Ipv4Addr)> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|iface| match iface.ip() {
+            std::net::IpAddr::V4(ip) => Some((iface.name, ip)),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .collect()
+}
+
+#[cfg(unix)]
 fn interface_ipv4s() -> Vec<(String, Ipv4Addr)> {
     let mut out = Vec::new();
     // SAFETY: getifaddrs fills a linked list we walk read-only and free once.

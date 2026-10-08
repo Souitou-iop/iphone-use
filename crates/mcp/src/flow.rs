@@ -11,6 +11,7 @@
 //! official flow registry (see `registry.rs`).
 
 use crate::client::DaemonClient;
+use crate::platform::OpenOptionsExt;
 use crate::registry;
 use crate::server::{phone_steps_request, PhoneStep};
 use anyhow::{bail, Context, Result};
@@ -18,7 +19,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 pub const FLOW_VERSION: u32 = 1;
@@ -472,7 +472,7 @@ pub fn read_flow_bytes(path: &Path) -> Result<Vec<u8>> {
     // that are not group/world-writable are accepted.
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(crate::platform::O_NOFOLLOW)
         .open(path)
         .with_context(|| {
             format!(
@@ -486,19 +486,8 @@ pub fn read_flow_bytes(path: &Path) -> Result<Vec<u8>> {
     if !metadata.file_type().is_file() {
         bail!("flow path is not a regular file: {}", path.display());
     }
-    let effective_uid = unsafe { libc::geteuid() };
-    if metadata.uid() != effective_uid {
-        bail!(
-            "flow file is not owned by the current user (uid {effective_uid}): {}",
-            path.display()
-        );
-    }
-    if metadata.mode() & 0o022 != 0 {
-        bail!(
-            "flow file must not be group- or world-writable: {}",
-            path.display()
-        );
-    }
+    #[cfg(unix)]
+    check_flow_owner(path, &metadata)?;
     if metadata.len() == 0 || metadata.len() > MAX_FLOW_BYTES {
         bail!(
             "flow file size must be between 1 and {MAX_FLOW_BYTES} bytes: {}",
@@ -513,6 +502,27 @@ pub fn read_flow_bytes(path: &Path) -> Result<Vec<u8>> {
         bail!("flow file grew beyond {MAX_FLOW_BYTES} bytes while being read");
     }
     Ok(bytes)
+}
+
+/// Owned by the current uid and not group/world-writable. Windows has neither
+/// uids nor mode bits; there the symlink check above is what remains.
+#[cfg(unix)]
+fn check_flow_owner(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let effective_uid = crate::platform::euid();
+    if metadata.uid() != effective_uid {
+        bail!(
+            "flow file is not owned by the current user (uid {effective_uid}): {}",
+            path.display()
+        );
+    }
+    if metadata.mode() & 0o022 != 0 {
+        bail!(
+            "flow file must not be group- or world-writable: {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Parse and fully validate flow JSON. `origin` only labels error messages.
@@ -581,7 +591,6 @@ pub fn load_flow(path: &Path) -> Result<ValidatedFlow> {
 /// what the `todo` list is for — and the error comes back as data.
 pub fn save_draft(path: &str, flow: &serde_json::Value) -> Result<serde_json::Value> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     if !flow.is_object() {
         bail!("the daemon returned no flow document");
     }
@@ -661,7 +670,7 @@ impl ArtifactsDir {
         for _ in 0..8 {
             let dir = base.join(format!("run-{}", unique_suffix()));
             let created = {
-                use std::os::unix::fs::DirBuilderExt as _;
+                use crate::platform::DirBuilderExt as _;
                 std::fs::DirBuilder::new()
                     .recursive(false)
                     .mode(0o700)
