@@ -61,7 +61,8 @@ jobs:
               "",
           ])
           out = subprocess.run(["target/release/iphone-use-mcp.exe"], input=requests,
-                               text=True, capture_output=True, timeout=60, check=True)
+                               text=True, encoding="utf-8", capture_output=True,
+                               timeout=60, check=True)
           responses = [json.loads(l) for l in out.stdout.splitlines() if l.strip()]
           tools = next(r for r in responses if r.get("id") == 2)["result"]["tools"]
           assert len(tools) == 23, [t["name"] for t in tools]
