@@ -34,6 +34,9 @@ Mac 上由 Xcode 和 LaunchAgent 完成的部分，在 Windows 上改为手动�
 2. 手机上：设置 → 通用 → VPN 与设备管理 → 信任你的 Apple ID。
 3. 如果还没开开发者模式，现在打开（手机会重启）。
 
+在主屏幕上点 iPhoneUse-Runner 图标，它会一闪就退出，**这是正常的**：它是 XCTest 运行器（和 WebDriverAgent 一样），
+只能由测试框架（下面的 `ios runtest`）启动，不能当普通 App 打开。是否装好，以第 2 步脚本能不能等到 runner 上线为准。
+
 ## 2. 启动
 
 解压 `iphone-use-windows-x64.zip`，把 `ios.exe` 放进同一目录，在 PowerShell 中运行：

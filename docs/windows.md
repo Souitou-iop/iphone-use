@@ -38,6 +38,11 @@ LaunchAgent is done by hand or by `iphone-use.ps1` here.
 2. On the phone: Settings → General → VPN & Device Management → trust your Apple ID.
 3. Turn Developer Mode on if it was not already (the phone restarts).
 
+Tapping the iPhoneUse-Runner icon opens and immediately closes it. **That is expected**: it is
+an XCTest runner (like WebDriverAgent's) and only runs when the test framework starts it
+(`ios runtest`, below). Whether it is installed correctly shows in step 2, when the script
+waits for the runner to come up.
+
 ## 2. Start everything
 
 Unzip `iphone-use-windows-x64.zip`, put `ios.exe` in the same folder, then in PowerShell:
