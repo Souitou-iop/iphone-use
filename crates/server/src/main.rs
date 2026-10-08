@@ -148,7 +148,8 @@ fn wda_management_pending(
 )]
 struct Cli {
     /// With no command (a double-click on the app in Finder or Launchpad),
-    /// open the control page in the browser.
+    /// open the control page in the browser; on Windows, the diagnostics page
+    /// (`gui`).
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -181,6 +182,29 @@ enum Command {
         /// Port on the iPhone to connect each client to.
         #[arg(long)]
         device_port: u16,
+    },
+    /// Open the diagnostics page: checks every link from usbmuxd to the MCP
+    /// bridge, starts the runner (go-ios), relays and daemon, and runs test
+    /// calls. Built for Windows; works anywhere.
+    Gui {
+        /// Port for the page (loopback only).
+        #[arg(long, default_value_t = 44390)]
+        port: u16,
+        /// Do not open the browser.
+        #[arg(long)]
+        no_open: bool,
+        /// go-ios binary (default: `ios` next to iphone-use, then PATH).
+        #[arg(long)]
+        ios: Option<std::path::PathBuf>,
+        /// The iPhone's UDID (default: the only one attached).
+        #[arg(long)]
+        udid: Option<String>,
+        /// The runner's bundle id (default: found with `ios apps --list`).
+        #[arg(long)]
+        bundle_id: Option<String>,
+        /// Port of the daemon it starts or tests.
+        #[arg(long, default_value_t = 44321)]
+        daemon_port: u16,
     },
     /// Read device facts from the iPhone's lockdownd over usbmuxd, as one JSON
     /// line: `info` (name, iOS version, model, build) or `ddi` (whether the
@@ -456,6 +480,7 @@ fn instance_context() -> Result<()> {
 
 /// The app has no window: a double-click opens the browser control page,
 /// first asking launchd to start the service if it is not answering.
+#[cfg(not(windows))]
 fn open_console() -> Result<()> {
     const LABEL: &str = "com.leeguoo.iphone-use";
     let port = std::env::var("PHONE_REMOTE_PORT")
@@ -496,27 +521,13 @@ fn open_console() -> Result<()> {
         anyhow::bail!("service not answering on {addr}");
     }
     eprintln!("opening {url}");
-    open_url(&url).context("open the control page")?;
+    server::platform::open_url(&url).context("open the control page")?;
     Ok(())
-}
-
-#[cfg(not(windows))]
-fn open_url(url: &str) -> std::io::Result<std::process::ExitStatus> {
-    std::process::Command::new("/usr/bin/open")
-        .arg(url)
-        .status()
-}
-
-#[cfg(windows)]
-fn open_url(url: &str) -> std::io::Result<std::process::ExitStatus> {
-    // `start` treats its first quoted argument as a window title.
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .status()
 }
 
 /// One value from the installed LaunchAgent's EnvironmentVariables, which a
 /// Finder launch does not inherit.
+#[cfg(not(windows))]
 fn launch_agent_env(label: &str, key: &str) -> Option<String> {
     let plist = dirs_home()?.join(format!("Library/LaunchAgents/{label}.plist"));
     let out = std::process::Command::new("/usr/bin/plutil")
@@ -536,6 +547,7 @@ fn launch_agent_env(label: &str, key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+#[cfg(not(windows))]
 fn dirs_home() -> Option<std::path::PathBuf> {
     server::platform::home_dir()
 }
@@ -637,6 +649,22 @@ fn main() -> Result<()> {
     // Older Launch Services hands a Finder launch a `-psn_…` argument.
     let cli = Cli::parse_from(std::env::args().filter(|a| !a.starts_with("-psn_")));
     let Some(command) = cli.command else {
+        // Windows has no installed service to open; a double-click on
+        // iphone-use.exe opens the diagnostics page, which starts everything.
+        #[cfg(windows)]
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("start the diagnostics runtime")?
+            .block_on(server::gui::run(server::gui::GuiOptions {
+                port: 44390,
+                open: true,
+                ios: None,
+                udid: None,
+                bundle_id: None,
+                daemon_port: 44321,
+            }));
+        #[cfg(not(windows))]
         return open_console();
     };
     // Only the long-running service earns the unattended-relaunch backoff
@@ -663,6 +691,25 @@ fn main() -> Result<()> {
             .context("start the relay runtime")?
             .block_on(server::usbmux::run_relay(&udid, listen, device_port)),
         Command::Device { query } => std::process::exit(device_query(query)),
+        Command::Gui {
+            port,
+            no_open,
+            ios,
+            udid,
+            bundle_id,
+            daemon_port,
+        } => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("start the diagnostics runtime")?
+            .block_on(server::gui::run(server::gui::GuiOptions {
+                port,
+                open: !no_open,
+                ios,
+                udid,
+                bundle_id,
+                daemon_port,
+            })),
         Command::Upgrade { check, json } => std::process::exit(upgrade(check || json, json)),
         Command::Setup { instance, args } => {
             let target = onboarding::Target::resolve(instance.as_deref())?;

@@ -69,12 +69,50 @@ jobs:
           print(f"MCP exposes {len(tools)} tools on Windows")
           PY
 
+      # The diagnostics page on a machine with no Apple Mobile Device
+      # Service: it must serve, refuse a request without its nonce, and
+      # report usbmuxd as the first broken link.
+      - name: Smoke test (diagnostics page)
+        shell: pwsh
+        run: |
+          $gui = Start-Process -FilePath target/release/iphone-use.exe -ArgumentList "gui", "--no-open" -PassThru
+          try {
+            $page = $null
+            for ($i = 0; $i -lt 40 -and -not $page; $i++) {
+              try { $page = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:44390/ } catch { Start-Sleep -Milliseconds 500 }
+            }
+            if (-not $page) { throw "diagnostics page did not come up" }
+            $nonce = [regex]::Match($page.Content, 'const NONCE = "([0-9a-f]+)"').Groups[1].Value
+            if (-not $nonce) { throw "no nonce in the page" }
+            $denied = $false
+            try { Invoke-RestMethod http://127.0.0.1:44390/api/checks | Out-Null } catch { $denied = $true }
+            if (-not $denied) { throw "/api/checks answered without the nonce" }
+            $checks = Invoke-RestMethod http://127.0.0.1:44390/api/checks -Headers @{ "X-IU-GUI" = $nonce }
+            $checks.checks | Format-Table id, status, detail -AutoSize | Out-String -Width 200 | Write-Host
+            if ($checks.checks.Count -ne 10) { throw "expected 10 checks" }
+            if ($checks.checks[0].status -ne "fail") { throw "usbmuxd should fail on a CI runner" }
+          } finally {
+            Stop-Process -Id $gui.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      # go-ios starts the runner on Windows (MIT licensed; shipped with its
+      # license so the zip works without another download).
+      - name: Fetch go-ios
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force goios | Out-Null
+          Invoke-WebRequest -UseBasicParsing -OutFile goios/win.zip https://github.com/danielpaulus/go-ios/releases/latest/download/go-ios-win.zip
+          Expand-Archive goios/win.zip -DestinationPath goios -Force
+          Invoke-WebRequest -UseBasicParsing -OutFile goios/GO-IOS-LICENSE.txt https://raw.githubusercontent.com/danielpaulus/go-ios/main/LICENSE
+          & goios/ios.exe version
+
       - name: Package
         shell: pwsh
         run: |
           $dir = "iphone-use-windows-x64"
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item target/release/iphone-use.exe, target/release/iphone-use-mcp.exe $dir
+          Copy-Item goios/ios.exe, goios/GO-IOS-LICENSE.txt $dir
           Copy-Item scripts/windows/iphone-use.ps1, docs/windows.md, docs/windows.zh-CN.md, LICENSE $dir
           Compress-Archive -Path "$dir/*" -DestinationPath "$dir.zip" -Force
           (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash.ToLower() + "  $dir.zip" | Out-File -Encoding ascii "$dir.zip.sha256"
@@ -120,6 +158,29 @@ jobs:
           rm -rf Payload && mkdir Payload
           cp -R "$app" Payload/
           zip -qry iPhoneUse-Runner-unsigned.ipa Payload
+          # What a re-signer and `ios runtest` rely on, printed for diagnosis:
+          # the bundle layout, the keys go-ios reads, and that every @rpath
+          # library the runner and its test bundle link is shipped in
+          # Frameworks/ (a missing one is a crash on launch).
+          a="Payload/iPhoneUse-Runner.app"
+          echo "── bundle layout"; find "$a" -maxdepth 2 | sed "s|^$a|.|" | sort
+          echo "── Info.plist"
+          for key in CFBundleIdentifier CFBundleExecutable CFBundleName MinimumOSVersion UIDeviceFamily; do
+            printf '%s = %s\n' "$key" "$(plutil -extract "$key" raw -o - "$a/Info.plist" 2>/dev/null || echo '?')"
+          done
+          xctest="$a/PlugIns/iPhoneUse.xctest"
+          printf 'xctest CFBundleIdentifier = %s\n' "$(plutil -extract CFBundleIdentifier raw -o - "$xctest/Info.plist")"
+          missing=0
+          for bin in "$a/$(plutil -extract CFBundleExecutable raw -o - "$a/Info.plist")" "$xctest/$(plutil -extract CFBundleExecutable raw -o - "$xctest/Info.plist")"; do
+            echo "── linked by ${bin#Payload/}"; otool -L "$bin" | tail -n +2
+            for lib in $(otool -L "$bin" | awk '/@rpath\//{print $1}'); do
+              name="${lib#@rpath/}"
+              if [ -e "$a/Frameworks/$name" ]; then echo "   ok      $name"; else echo "   MISSING $name"; missing=1; fi
+            done
+          done
+          lipo -archs "$a/$(plutil -extract CFBundleExecutable raw -o - "$a/Info.plist")"
+          # Report, don't gate: an @rpath library can also resolve to the OS.
+          if [ "$missing" != 0 ]; then echo "::warning::runner links @rpath libraries not in Frameworks/ (see above)"; fi
           shasum -a 256 iPhoneUse-Runner-unsigned.ipa > iPhoneUse-Runner-unsigned.ipa.sha256
           cat iPhoneUse-Runner-unsigned.ipa.sha256
 

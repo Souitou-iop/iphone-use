@@ -4,14 +4,14 @@
 
 守护进程（`iphone-use.exe`）和 MCP 桥（`iphone-use-mcp.exe`）可以在 Windows 10/11 x64 上原生编译、运行。
 Agent API、MCP 工具、流程（flows）和网页控制台（`/phone`，MJPEG 实时画面）与 Mac 上一致。
-Mac 上由 Xcode 和 LaunchAgent 完成的部分，在 Windows 上改为手动或由 `iphone-use.ps1` 完成。
+Mac 上由 Xcode 和 LaunchAgent 完成的部分，在 Windows 上由**诊断面板**（双击 `iphone-use.exe`）一键完成，也可以用 `iphone-use.ps1` 或手动完成。
 
 | | macOS | Windows |
 |---|---|---|
 | usbmuxd | 系统自带 | Apple Mobile Device Service（`127.0.0.1:27015`） |
 | 编译、签名 runner | `setup-wda.sh` + Xcode | 下载未签名 IPA，自行签名 |
 | 启动 runner（XCTest） | `xcodebuild test-without-building` | [go-ios](https://github.com/danielpaulus/go-ios) `ios runtest` |
-| 保活 | LaunchAgent 守护 | `iphone-use.ps1`（前台运行；runner 挂了需重跑） |
+| 启动、保活 | LaunchAgent 守护 | 诊断面板 / `iphone-use.ps1`（runner 挂了在面板里点“启动”） |
 | 实时画面 | H.264（VideoToolbox）或 MJPEG | MJPEG |
 | `setup`、`doctor`、`upgrade`、空闲释放、已装应用列表 | 有 | 暂无 |
 
@@ -22,7 +22,7 @@ Mac 上由 Xcode 和 LaunchAgent 完成的部分，在 Windows 上改为手动�
   插上 iPhone、解锁并点 **信任**。
 - iPhone 打开 **开发者模式**（设置 → 隐私与安全性 → 开发者模式）。iOS 16+ 要先装过一个开发者 App 才会出现这个开关，
   所以装好 runner 之后再打开。
-- Windows 版 **go-ios**（`ios.exe`），见其 [releases](https://github.com/danielpaulus/go-ios/releases)。
+- **go-ios**（`ios.exe`）：已随 `iphone-use-windows-x64.zip` 附带（MIT 许可，见 `GO-IOS-LICENSE.txt`）。
 - 用 Apple ID 给 IPA 签名的工具：[Sideloadly](https://sideloadly.io/)（免费 Apple ID 即可），
   或用自己的 `.p12` 证书和描述文件执行 `ios sign app --path <ipa> --p12file … --profile … --install`（go-ios 1.3.2）。
 - Release（或 *Windows* 工作流产物）里的 `iphone-use-windows-x64.zip` 和 `iPhoneUse-Runner-unsigned.ipa`。
@@ -35,11 +35,29 @@ Mac 上由 Xcode 和 LaunchAgent 完成的部分，在 Windows 上改为手动�
 3. 如果还没开开发者模式，现在打开（手机会重启）。
 
 在主屏幕上点 iPhoneUse-Runner 图标，它会一闪就退出，**这是正常的**：它是 XCTest 运行器（和 WebDriverAgent 一样），
-只能由测试框架（下面的 `ios runtest`）启动，不能当普通 App 打开。是否装好，以第 2 步脚本能不能等到 runner 上线为准。
+只能由测试框架（下面的 `ios runtest`）启动，不能当普通 App 打开。是否装好，以第 2 步诊断面板里“Runner 在手机上运行”能否变绿为准。
 
-## 2. 启动
+## 2. 启动：诊断面板（推荐）
 
-解压 `iphone-use-windows-x64.zip`，把 `ios.exe` 放进同一目录，在 PowerShell 中运行：
+解压 `iphone-use-windows-x64.zip`，**双击 `iphone-use.exe`**（等同于 `iphone-use.exe gui`），浏览器会打开
+`http://127.0.0.1:44390/` 的诊断面板：
+
+- **链路检查**：从上到下 10 项，逐级依赖——usbmuxd → iPhone → 配对/开发者磁盘镜像 → go-ios → iOS 17+ 隧道 →
+  Runner 已安装 → Runner 在手机上运行 → 端口转发 → 守护进程 → MCP。**第一个红点就是要解决的问题**，旁边写着原因和下一步，
+  能自动处理的那一步有按钮（启动 / 挂载）。
+- **一键启动**：按顺序启动隧道、挂载镜像、`ios runtest`、两个 relay 和 `iphone-use serve`；**全部停止**一起关掉。
+  关闭面板（Ctrl+C）也会停掉它启动的所有进程。
+- **调用测试**：经守护进程真实调用一次——状态、读屏、截图、回到主屏幕、MCP 握手（`tools/list` + `phone_status`）。
+  全部成功就说明 Agent 能正常调用。
+- **进程与日志**：每个子进程的实时输出（runner 起不来时看这里）。
+- **接入 Agent**：现成的 MCP 配置（含 token），一键复制。
+
+参数：`iphone-use gui --udid … --bundle-id … --ios <ios.exe 路径> --port 44390 --daemon-port 44321 --no-open`，
+也可以在面板的“设置”里填。
+
+### 或者：PowerShell 脚本
+
+在 PowerShell 中运行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\iphone-use.ps1

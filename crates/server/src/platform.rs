@@ -88,9 +88,30 @@ pub fn home_dir() -> Option<std::path::PathBuf> {
 /// (`~/.iphone-use`, flows, caches), so point it at the user profile. Call
 /// first thing in `main`, before any thread starts.
 pub fn ensure_home() {
-    if std::env::var_os("HOME").map_or(true, |home| home.is_empty()) {
+    if std::env::var_os("HOME").is_none_or(|home| home.is_empty()) {
         if let Some(home) = home_dir() {
             std::env::set_var("HOME", home);
         }
+    }
+}
+
+/// Open `url` in the default browser.
+pub fn open_url(url: &str) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(windows)]
+    {
+        // `start` treats its first quoted argument as a window title.
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .status()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("/usr/bin/open")
+            .arg(url)
+            .status()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(url).status()
     }
 }
