@@ -24,7 +24,7 @@ Mac 上由 Xcode 和 LaunchAgent 完成的部分，在 Windows 上改为手动�
   所以装好 runner 之后再打开。
 - Windows 版 **go-ios**（`ios.exe`），见其 [releases](https://github.com/danielpaulus/go-ios/releases)。
 - 用 Apple ID 给 IPA 签名的工具：[Sideloadly](https://sideloadly.io/)（免费 Apple ID 即可），
-  或用自己的 `.p12` 证书和描述文件执行 `ios ui install`。
+  或用自己的 `.p12` 证书和描述文件执行 `ios sign app --path <ipa> --p12file … --profile … --install`（go-ios 1.3.2）。
 - Release（或 *Windows* 工作流产物）里的 `iphone-use-windows-x64.zip` 和 `iPhoneUse-Runner-unsigned.ipa`。
 
 ## 1. 在手机上安装 runner

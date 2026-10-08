@@ -108,7 +108,7 @@ jobs:
 
       # The same unsigned build-for-testing runner/ci-check.sh compiles,
       # packaged as an IPA a Windows user re-signs (Sideloadly, or
-      # `ios ui install` with their own certificate and profile).
+      # `ios sign app` with their own certificate and profile).
       - name: Build and package
         shell: bash
         run: |

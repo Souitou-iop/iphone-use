@@ -127,7 +127,7 @@ curl.exe http://127.0.0.1:44321/agent/status
 | ② 报 `connect usbmuxd` | 27015 端口不通 | `usbmux.rs` 的 `open_mux` / `mux_address`；可设 `USBMUXD_SOCKET_ADDRESS` |
 | ③ 报 `no pairing record` | AMDS 不支持 `ReadPairRecord`，文件回退也没读到 | `usbmux.rs` 的 `read_pair_record`；检查 `%ProgramData%\Apple\Lockdown\` 下文件名大小写、有没有横杠 |
 | ③ 报 TLS 错误 | Windows 上的配对记录格式不同（例如二进制 plist） | `lockdown.rs` 的 `PairRecord::parse`；这里只认 XML plist |
-| ⑦ 报签名或 dylib 错误 | Sideloadly 没签好 `Frameworks` / `PlugIns` | 换成 `ios ui install wda --p12file … --profile … --path <ipa>` 自签 |
+| ⑦ 报签名或 dylib 错误 | Sideloadly 没签好 `Frameworks` / `PlugIns` | 换成 `ios sign app --path <ipa> --p12file … --profile … --install` 自签 |
 | ⑦ 报连不上 testmanagerd | iOS 17+ 隧道没起来 | 看 ④ 的输出；试试以管理员身份运行、去掉 `--userspace` |
 | ⑦ 正常，但 ⑧ 失败 | runner 端口没监听 | 看 ⑦ 的日志有没有 `ServerURLHere` |
 | ⑩ 状态里 `drivable:false` | 健康探测失败 | `http.rs` 的 `/agent/status`、`wda.rs` 的健康探测；runner 的日志 |
@@ -156,7 +156,7 @@ curl.exe http://127.0.0.1:44321/agent/status
 4. **`/agent/apps`**：现在依赖 `devicectl`，Windows 上返回不可用；可以改用 go-ios `ios apps` 或 installation_proxy。
 5. **`stop` 优雅退出**：现在是 `TerminateProcess`；可以改成守护进程监听一个停止信号（命名事件或本地 HTTP 端点）。
 6. **H.264 画面**：Windows 上可以用 Media Foundation 编码，目前只有 MJPEG。
-7. **签名门槛**：研究 go-ios `ios ui install` 自签流程，写进文档，减少对 Sideloadly 的依赖。
+7. **签名门槛**：研究 go-ios `ios sign app` 自签流程，写进文档，减少对 Sideloadly 的依赖。
 8. 是否向上游（leeguooooo/iphone-use）提 PR：建议实机跑通后再提。改动都用 `cfg(windows)` 隔开，对 Mac 端无影响，上游接受的可能性较高。
 
 ## 8. 关键环境变量

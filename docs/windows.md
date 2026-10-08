@@ -26,7 +26,7 @@ LaunchAgent is done by hand or by `iphone-use.ps1` here.
   it on after installing the runner.
 - **go-ios** for Windows (`ios.exe`) from its [releases](https://github.com/danielpaulus/go-ios/releases).
 - A way to sign an IPA with your Apple ID: [Sideloadly](https://sideloadly.io/) (free Apple
-  ID works), or `ios ui install` with your own `.p12` certificate and provisioning profile.
+  ID works), or `ios sign app --path <ipa> --p12file … --profile … --install` (go-ios 1.3.2) with your own `.p12` certificate and provisioning profile.
 - `iphone-use-windows-x64.zip` and `iPhoneUse-Runner-unsigned.ipa` from the release (or
   the *Windows* workflow's artifacts).
 
