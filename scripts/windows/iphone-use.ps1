@@ -26,7 +26,7 @@
 param(
     # The iPhone's UDID. Default: the only phone go-ios lists.
     [string]$Udid,
-    # The installed runner's bundle id (…xctrunner). Default: found on the phone.
+    # The installed runner's bundle id (...xctrunner). Default: found on the phone.
     [string]$BundleId,
     # go-ios binary. Default: ios.exe next to this script, then PATH.
     [string]$Ios,
@@ -75,13 +75,22 @@ function Start-Background([string]$name, [string]$file, [string[]]$arguments) {
 $Ios = Find-Tool $Ios "ios"
 $IphoneUse = Find-Tool $IphoneUse "iphone-use"
 
-# ── 1. usbmuxd ──────────────────────────────────────────────────────────────
+# -- 1. usbmuxd --------------------------------------------------------------
 if (-not (Test-Port "127.0.0.1" 27015)) {
     throw "Apple Mobile Device Service is not answering on 127.0.0.1:27015. " +
           "Install 'Apple Devices' from the Microsoft Store (or iTunes), plug the iPhone in and tap Trust."
 }
 
-# ── 2. which phone ──────────────────────────────────────────────────────────
+# Leftovers from an earlier run (a closed window can orphan them) would answer
+# instead of this run's runner and keep `serve` from binding its port.
+foreach ($busy in @(8100, 9100, $Port)) {
+    if (Test-Port "127.0.0.1" $busy) {
+        throw "Port $busy is already in use, probably by an earlier run. Stop it first: " +
+              "Get-Process iphone-use, ios -ErrorAction SilentlyContinue | Stop-Process"
+    }
+}
+
+# -- 2. which phone ----------------------------------------------------------
 if (-not $Udid) {
     $listed = (& $Ios list | ConvertFrom-Json).deviceList
     if (-not $listed) { throw "No iPhone attached. Plug it in, unlock it and tap Trust." }
@@ -95,9 +104,10 @@ $iosMajor = [int]($info.product_version -split '\.')[0]
 
 $children = New-Object System.Collections.ArrayList
 try {
-    # ── 3. iOS 17+: the tunnel testmanagerd is reached through ──────────────
+    # -- 3. iOS 17+: the tunnel testmanagerd is reached through --------------
     if ($iosMajor -ge 17 -and -not $NoTunnel) {
-        if (Test-Port "127.0.0.1" 60105) {
+        # go-ios's tunnel agent answers on --tunnel-info-port, 28100 by default.
+        if (Test-Port "127.0.0.1" 28100) {
             Write-Host "go-ios tunnel agent already running"
         } else {
             [void]$children.Add((Start-Background "tunnel" $Ios @("tunnel", "start", "--userspace")))
@@ -105,26 +115,28 @@ try {
         }
     }
 
-    # ── 4. Developer Disk Image ─────────────────────────────────────────────
+    # -- 4. Developer Disk Image ---------------------------------------------
     & $Ios image auto "--udid=$Udid" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "go-ios could not mount the Developer Disk Image (is Developer Mode on?)" }
 
-    # ── 5. the runner ───────────────────────────────────────────────────────
+    # -- 5. the runner -------------------------------------------------------
     if (-not $BundleId) {
         $apps = & $Ios apps --list "--udid=$Udid"
-        $BundleId = ($apps | ForEach-Object { ($_ -split '\s+')[0] } |
-            Where-Object { $_ -like "*.xctrunner" -and $_ -match "iphone-?use|iPhoneUse" } |
-            Select-Object -First 1)
+        # `apps --list` prints "<bundle id> <name> <version>". Sideloadly may
+        # rename the bundle id, so match the app name (iPhoneUse-Runner) too.
+        $BundleId = ($apps | Where-Object { $_ -match "xctrunner" -and $_ -match "iphone-?use" } |
+            ForEach-Object { ($_ -split '\s+')[0] } | Select-Object -First 1)
         if (-not $BundleId) {
             throw "The iPhoneUse-Runner app is not installed on the phone. See docs/windows.md (install the runner IPA)."
         }
     }
     Write-Host "runner: $BundleId"
-    [void]$children.Add((Start-Background "runner" $Ios @(
+    $runnerProc = Start-Background "runner" $Ios @(
         "runtest", "--bundle-id=$BundleId", "--test-runner-bundle-id=$BundleId",
-        "--xctest-config=iPhoneUse.xctest", "--test-to-run=RunnerTests/testServe", "--udid=$Udid")))
+        "--xctest-config=iPhoneUse.xctest", "--test-to-run=RunnerTests/testServe", "--udid=$Udid")
+    [void]$children.Add($runnerProc)
 
-    # ── 6. relays to the runner's ports ─────────────────────────────────────
+    # -- 6. relays to the runner's ports -------------------------------------
     [void]$children.Add((Start-Background "relay-8100" $IphoneUse @(
         "relay", "--udid", $Udid, "--listen", "127.0.0.1:8100", "--device-port", "8100")))
     [void]$children.Add((Start-Background "relay-9100" $IphoneUse @(
@@ -134,6 +146,10 @@ try {
     $deadline = (Get-Date).AddSeconds(90)
     $up = $false
     while ((Get-Date) -lt $deadline) {
+        if ($runnerProc.HasExited) {
+            $tail = (Get-Content (Join-Path $logDir "runner.log.err") -Tail 15 -ErrorAction SilentlyContinue) -join "`n"
+            throw "The runner (ios runtest) exited with code $($runnerProc.ExitCode):`n$tail"
+        }
         try {
             Invoke-RestMethod -Uri "http://127.0.0.1:8100/status" -TimeoutSec 3 | Out-Null
             $up = $true
@@ -143,7 +159,7 @@ try {
     if (-not $up) { throw "The runner did not answer within 90 s; see $logDir\runner.log" }
     Write-Host "runner is up"
 
-    # ── 7. the daemon ───────────────────────────────────────────────────────
+    # -- 7. the daemon -------------------------------------------------------
     $tokenFile = Join-Path $stateDir "agent-token"
     if (-not (Test-Path $tokenFile)) {
         $bytes = New-Object byte[] 24

@@ -143,6 +143,36 @@ pub(crate) async fn find_attached(want: &str) -> Result<Option<Attached>> {
     Ok(pick_attached(&reply, want))
 }
 
+/// Every phone usbmuxd lists (the diagnostics page shows them all).
+pub async fn list_attached() -> Result<Vec<(String, bool)>> {
+    let mut mux = open_mux().await?;
+    let reply = request(&mut mux, &list_devices_message()).await?;
+    let mut out: Vec<(String, bool)> = Vec::new();
+    for entry in reply
+        .get("DeviceList")
+        .and_then(Value::as_array)
+        .unwrap_or_default()
+    {
+        let Some(properties) = entry.get("Properties") else {
+            continue;
+        };
+        let Some(serial) = properties.get("SerialNumber").and_then(Value::as_str) else {
+            continue;
+        };
+        let usb = properties.get("ConnectionType").and_then(Value::as_str) == Some("USB");
+        match out.iter_mut().find(|(known, _)| known == serial) {
+            Some(known) => known.1 |= usb,
+            None => out.push((serial.to_string(), usb)),
+        }
+    }
+    Ok(out)
+}
+
+/// Where usbmuxd is expected, for messages.
+pub fn mux_address_for_display() -> String {
+    mux_address()
+}
+
 /// The pairing record usbmuxd keeps for `serial` (the plist bytes of
 /// `/var/db/lockdown/<udid>.plist`, which only root can read directly; on
 /// Windows `%ProgramData%\Apple\Lockdown\<udid>.plist`).

@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iphone-use 诊断面板</title>
+<style>
+:root {
+  --bg: #f5f6f8; --panel: #ffffff; --text: #1d2129; --muted: #6b7280; --line: #e5e7eb;
+  --ok: #16a34a; --warn: #d97706; --fail: #dc2626; --skip: #9ca3af; --accent: #2563eb;
+  --code: #f3f4f6; --chip: #eef2ff;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115; --panel: #171a21; --text: #e5e7eb; --muted: #9ca3af; --line: #2a2f3a;
+    --ok: #22c55e; --warn: #f59e0b; --fail: #f87171; --skip: #6b7280; --accent: #60a5fa;
+    --code: #0b0d12; --chip: #1e293b;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif; }
+header { position: sticky; top: 0; z-index: 2; background: var(--panel); border-bottom: 1px solid var(--line);
+  padding: 12px 20px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+h1 { font-size: 17px; margin: 0; font-weight: 600; }
+.verdict { padding: 4px 12px; border-radius: 999px; font-weight: 600; background: var(--chip); }
+.verdict.ok { color: var(--ok); } .verdict.fail { color: var(--fail); } .verdict.warn { color: var(--warn); }
+.device { color: var(--muted); }
+.spacer { flex: 1; }
+button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+  padding: 5px 12px; border-radius: 8px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: .5; cursor: progress; }
+main { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 16px; padding: 16px 20px; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+section h2 { font-size: 15px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+section h2 .sub { color: var(--muted); font-weight: 400; font-size: 12px; }
+.stack { display: flex; flex-direction: column; gap: 16px; }
+ol.checks { list-style: none; margin: 0; padding: 0; }
+ol.checks li { display: grid; grid-template-columns: 22px 1fr auto; gap: 4px 10px; padding: 10px 0;
+  border-top: 1px solid var(--line); align-items: start; }
+ol.checks li:first-child { border-top: 0; }
+.dot { width: 12px; height: 12px; border-radius: 50%; margin-top: 4px; background: var(--skip); }
+.dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.fail { background: var(--fail); }
+.title { font-weight: 600; }
+.title .n { color: var(--muted); font-weight: 400; margin-right: 4px; }
+.detail { color: var(--muted); word-break: break-all; grid-column: 2; }
+.hint { grid-column: 2; color: var(--warn); }
+li.fail .hint { color: var(--fail); }
+.ms { color: var(--muted); font-size: 12px; text-align: right; }
+.row-actions { grid-column: 3; grid-row: 1 / span 3; display: flex; flex-direction: column; gap: 4px; align-items: end; }
+.tests { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin: 0;
+  overflow: auto; font: 12px/1.45 ui-monospace, Consolas, "Cascadia Mono", monospace; white-space: pre-wrap; word-break: break-all; }
+#result { max-height: 260px; }
+#shot { display: none; max-width: 100%; max-height: 420px; margin-top: 10px; border-radius: 10px; border: 1px solid var(--line); }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.tab { padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); cursor: pointer; font-size: 13px; }
+.tab.on { border-color: var(--accent); color: var(--accent); }
+.tab .s { font-size: 11px; margin-left: 4px; }
+.tab .s.running { color: var(--ok); } .tab .s.dead { color: var(--fail); }
+#log { height: 300px; }
+.config { display: none; gap: 8px; flex-wrap: wrap; align-items: center; padding: 10px 20px; background: var(--panel);
+  border-bottom: 1px solid var(--line); }
+.config.open { display: flex; }
+.config label { display: flex; gap: 6px; align-items: center; color: var(--muted); }
+.config input { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); min-width: 260px; }
+.muted { color: var(--muted); }
+.toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg);
+  padding: 8px 16px; border-radius: 8px; max-width: 80vw; display: none; z-index: 5; }
+</style>
+</head>
+<body>
+<header>
+  <h1>iphone-use 诊断面板</h1>
+  <span id="verdict" class="verdict">检查中…</span>
+  <span id="device" class="device"></span>
+  <span class="spacer"></span>
+  <label class="muted"><input type="checkbox" id="auto" checked> 自动刷新</label>
+  <button id="cfgbtn">设置</button>
+  <button id="refresh">立即检查</button>
+  <button id="stopall">全部停止</button>
+  <button id="startall" class="primary">一键启动</button>
+</header>
+<div id="config" class="config">
+  <label>UDID <input id="cfg-udid" placeholder="只连一台手机时留空"></label>
+  <label>Runner bundle id <input id="cfg-bundle" placeholder="留空自动查找 …xctrunner"></label>
+  <label>go-ios 路径 <input id="cfg-ios" placeholder="留空：同目录或 PATH 里的 ios"></label>
+  <button id="cfg-save">保存</button>
+</div>
+<main>
+  <div class="stack">
+    <section>
+      <h2>链路检查 <span class="sub">从上到下逐级依赖；第一个红点就是要解决的问题</span></h2>
+      <ol id="checks" class="checks"></ol>
+    </section>
+    <section>
+      <h2>接入 Agent <span class="sub">MCP 客户端配置</span></h2>
+      <pre id="mcpcfg">…</pre>
+      <p class="muted" style="margin:8px 0 0">token 文件：<span id="tokenfile"></span> <button id="copycfg">复制配置</button></p>
+    </section>
+  </div>
+  <div class="stack">
+    <section>
+      <h2>调用测试 <span class="sub">经守护进程实际调用一次</span></h2>
+      <div class="tests">
+        <button data-test="status">状态 /agent/status</button>
+        <button data-test="elements">读屏 /agent/elements</button>
+        <button data-test="screenshot">截图</button>
+        <button data-test="home">回到主屏幕</button>
+        <button data-test="mcp">MCP 握手</button>
+      </div>
+      <pre id="result" class="muted">点一个按钮开始。全部检查变绿后，这里每一项都应成功。</pre>
+      <img id="shot" alt="截图">
+    </section>
+    <section>
+      <h2>进程与日志 <span class="sub">本页启动的进程</span></h2>
+      <div id="tabs" class="tabs"></div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+        <span id="procinfo" class="muted" style="flex:1;word-break:break-all"></span>
+        <button id="stopone" style="display:none">停止</button>
+      </div>
+      <pre id="log" class="muted">还没有进程。点“一键启动”或某一步的按钮。</pre>
+    </section>
+  </div>
+</main>
+<div id="toast" class="toast"></div>
+<script>
+const NONCE = "__NONCE__";
+const $ = (id) => document.getElementById(id);
+let current = null, busy = false, lastChecks = null;
+
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method, headers: { "X-IU-GUI": NONCE, "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return res.json();
+}
+function toast(text, ms = 4000) {
+  const t = $("toast"); t.textContent = text; t.style.display = "block";
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => t.style.display = "none", ms);
+}
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+const ACTION_LABEL = { tunnel: "启动", ddi: "挂载", runner: "启动", relays: "启动", daemon: "启动", refresh_apps: "重新读取" };
+
+async function loadChecks() {
+  let data;
+  try { data = await api("GET", "/api/checks"); } catch (e) { $("verdict").textContent = "面板已断开"; $("verdict").className = "verdict fail"; return; }
+  lastChecks = data;
+  const list = $("checks"); list.innerHTML = "";
+  data.checks.forEach((c, i) => {
+    const li = document.createElement("li"); li.className = c.status;
+    const action = c.action ? `<button data-action="${c.action}">${ACTION_LABEL[c.action] || "执行"}</button>` : "";
+    li.innerHTML = `<span class="dot ${c.status}"></span>
+      <div class="title"><span class="n">${i + 1}.</span>${esc(c.title)}</div>
+      <div class="row-actions">${action}<span class="ms">${c.status === "skip" ? "" : c.ms + " ms"}</span></div>
+      <div class="detail">${c.status === "skip" ? "上一步未通过，跳过" : esc(c.detail)}</div>
+      ${c.hint ? `<div class="hint">→ ${esc(c.hint)}</div>` : ""}`;
+    list.appendChild(li);
+  });
+  const v = $("verdict");
+  const fails = data.checks.filter(c => c.status === "fail");
+  if (!fails.length && data.summary.drivable) { v.textContent = "✓ 可以正常调用"; v.className = "verdict ok"; }
+  else if (!fails.length) { v.textContent = "基本就绪，等待可驱动"; v.className = "verdict warn"; }
+  else { v.textContent = "卡在：" + data.first_failure; v.className = "verdict fail"; }
+  const s = data.summary;
+  $("device").textContent = s.udid ? `${s.name || ""} · iOS ${s.ios || "?"} · ${s.udid}` : "";
+  $("mcpcfg").textContent = JSON.stringify({ mcpServers: { "iphone-use": {
+    command: data.mcp_path || "iphone-use-mcp", env: data.mcp_env } } }, null, 2);
+  $("tokenfile").textContent = data.token_file || "";
+  if (document.activeElement.tagName !== "INPUT") {
+    $("cfg-udid").value = data.udid_override || "";
+    $("cfg-ios").value = data.ios_path || "";
+    if (!$("cfg-bundle").value) $("cfg-bundle").placeholder = data.bundle_id ? `自动：${data.bundle_id}` : "留空自动查找 …xctrunner";
+  }
+}
+
+async function loadProcs() {
+  const procs = await api("GET", "/api/procs").catch(() => []);
+  const tabs = $("tabs"); tabs.innerHTML = "";
+  if (!procs.length) return;
+  if (!current || !procs.find(p => p.name === current)) current = procs[0].name;
+  for (const p of procs) {
+    const t = document.createElement("span");
+    t.className = "tab" + (p.name === current ? " on" : "");
+    const cls = p.state === "running" ? "running" : "dead";
+    t.innerHTML = `${esc(p.name)}<span class="s ${cls}">${p.state === "running" ? "运行中" : esc(p.state)}</span>`;
+    t.onclick = () => { current = p.name; loadProcs(); };
+    tabs.appendChild(t);
+  }
+  const p = procs.find(p => p.name === current);
+  $("procinfo").textContent = p.pid ? `pid ${p.pid} · ${p.uptime_s}s · ${p.command}` : p.state;
+  $("stopone").style.display = p.state === "running" ? "" : "none";
+  const log = $("log"); const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
+  log.textContent = p.log.join("\n") || "(暂无输出)"; log.classList.remove("muted");
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+
+async function run(label, fn) {
+  if (busy) return; busy = true;
+  document.querySelectorAll("button").forEach(b => b.disabled = true);
+  toast(label + "…", 60000);
+  try {
+    const r = await fn();
+    toast(r.ok ? (r.message || "完成") : ("失败：" + r.error), r.ok ? 3500 : 9000);
+  } catch (e) { toast("失败：" + e, 9000); }
+  busy = false; document.querySelectorAll("button").forEach(b => b.disabled = false);
+  await Promise.all([loadChecks(), loadProcs()]);
+}
+
+document.addEventListener("click", (e) => {
+  const a = e.target.closest("[data-action]");
+  if (a) run(a.textContent, () => api("POST", "/api/action/" + a.dataset.action));
+  const t = e.target.closest("[data-test]");
+  if (t) runTest(t.dataset.test, t.textContent);
+});
+async function runTest(name, label) {
+  if (busy) return; busy = true;
+  $("result").textContent = label + " …"; $("result").classList.remove("muted");
+  const r = await api("POST", "/api/test/" + name).catch(e => ({ ok: false, error: String(e) }));
+  busy = false;
+  const head = (r.ok ? "✓ 成功" : "✗ 失败") + `（${r.ms ?? "?"} ms）\n`;
+  if (!r.ok) { $("result").textContent = head + r.error; return; }
+  if (name === "screenshot") {
+    $("shot").src = "data:image/png;base64," + r.png; $("shot").style.display = "block";
+    $("result").textContent = head + `PNG ${r.bytes} 字节`;
+  } else if (name === "elements") {
+    $("result").textContent = head + `${r.count} 个元素\n` + r.labels.join("\n");
+  } else if (name === "mcp") {
+    $("result").textContent = head + `tools/list：${r.tools} 个工具\nphone_status：\n${r.phone_status ?? "(无)"}`;
+  } else {
+    $("result").textContent = head + JSON.stringify(r.result, null, 2);
+  }
+  if (name === "home") setTimeout(() => runTest("screenshot", "截图"), 600);
+}
+$("startall").onclick = () => run("一键启动", () => api("POST", "/api/action/all"));
+$("stopall").onclick = () => run("全部停止", () => api("POST", "/api/stop/all"));
+$("stopone").onclick = () => current && run("停止 " + current, () => api("POST", "/api/stop/" + current));
+$("refresh").onclick = () => run("检查", async () => ({ ok: true, message: "已刷新" }));
+$("cfgbtn").onclick = () => $("config").classList.toggle("open");
+$("cfg-save").onclick = () => run("保存设置", () => api("POST", "/api/config",
+  { udid: $("cfg-udid").value, bundle_id: $("cfg-bundle").value, ios: $("cfg-ios").value }));
+$("copycfg").onclick = () => navigator.clipboard.writeText($("mcpcfg").textContent).then(() => toast("已复制"));
+
+loadChecks(); loadProcs();
+setInterval(() => { if ($("auto").checked && !busy) loadChecks(); }, 4000);
+setInterval(() => { if (!busy) loadProcs(); }, 1500);
+</script>
+</body>
+</html>

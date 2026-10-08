@@ -5,14 +5,14 @@
 The daemon (`iphone-use.exe`) and the MCP bridge (`iphone-use-mcp.exe`) build and run
 natively on Windows 10/11 x64. The agent API, the MCP tools, flows and the web page
 (`/phone`, MJPEG live view) work the same as on a Mac. What a Mac does with Xcode and a
-LaunchAgent is done by hand or by `iphone-use.ps1` here.
+LaunchAgent is done by the **diagnostics page** here (double-click `iphone-use.exe`), or by `iphone-use.ps1`, or by hand.
 
 | | macOS | Windows |
 |---|---|---|
 | usbmuxd | macOS's own | Apple Mobile Device Service (`127.0.0.1:27015`) |
 | Build and sign the runner | `setup-wda.sh` + Xcode | download the unsigned IPA, sign it yourself |
 | Start the runner (XCTest) | `xcodebuild test-without-building` | [go-ios](https://github.com/danielpaulus/go-ios) `ios runtest` |
-| Keep it running | LaunchAgent supervisor | `iphone-use.ps1` (foreground; restart it if the runner dies) |
+| Start / keep running | LaunchAgent supervisor | diagnostics page / `iphone-use.ps1` (restart a dead runner from the page) |
 | Live view | H.264 (VideoToolbox) or MJPEG | MJPEG |
 | `setup`, `doctor`, `upgrade`, idle release, installed-app list | yes | not yet |
 
@@ -24,9 +24,9 @@ LaunchAgent is done by hand or by `iphone-use.ps1` here.
 - **Developer Mode** on the iPhone (Settings → Privacy & Security → Developer Mode). On
   iOS 16+ the switch only appears after a developer app has been installed once, so turn
   it on after installing the runner.
-- **go-ios** for Windows (`ios.exe`) from its [releases](https://github.com/danielpaulus/go-ios/releases).
+- **go-ios** (`ios.exe`): shipped in `iphone-use-windows-x64.zip` (MIT, see `GO-IOS-LICENSE.txt`).
 - A way to sign an IPA with your Apple ID: [Sideloadly](https://sideloadly.io/) (free Apple
-  ID works), or `ios ui install` with your own `.p12` certificate and provisioning profile.
+  ID works), or `ios sign app --path <ipa> --p12file … --profile … --install` (go-ios 1.3.2) with your own `.p12` certificate and provisioning profile.
 - `iphone-use-windows-x64.zip` and `iPhoneUse-Runner-unsigned.ipa` from the release (or
   the *Windows* workflow's artifacts).
 
@@ -40,12 +40,30 @@ LaunchAgent is done by hand or by `iphone-use.ps1` here.
 
 Tapping the iPhoneUse-Runner icon opens and immediately closes it. **That is expected**: it is
 an XCTest runner (like WebDriverAgent's) and only runs when the test framework starts it
-(`ios runtest`, below). Whether it is installed correctly shows in step 2, when the script
-waits for the runner to come up.
+(`ios runtest`, below). Whether it is installed correctly shows in step 2, when "Runner running
+on the phone" turns green on the diagnostics page.
 
-## 2. Start everything
+## 2. Start everything: the diagnostics page
 
-Unzip `iphone-use-windows-x64.zip`, put `ios.exe` in the same folder, then in PowerShell:
+Unzip `iphone-use-windows-x64.zip` and **double-click `iphone-use.exe`** (same as `iphone-use.exe gui`).
+The browser opens `http://127.0.0.1:44390/`:
+
+- **Chain checks**: ten checks, each depending on the one above (usbmuxd, iPhone, pairing / disk image,
+  go-ios, iOS 17+ tunnel, runner installed, runner running on the phone, relays, daemon, MCP). The
+  **first red dot is the problem to fix**; it says why and what to do, with a button where the page
+  can do it (start / mount).
+- **One-click start** runs the tunnel, disk image, `ios runtest`, both relays and `iphone-use serve`
+  in order; **Stop all** (or closing the page's process) stops everything it started.
+- **Test calls** go through the daemon for real: status, read the screen, screenshot, Home, and an
+  MCP handshake (`tools/list` + `phone_status`). All green means an agent can drive the phone.
+- **Processes and logs** shows each child's live output; **Connect an agent** has a ready MCP config.
+
+Options: `iphone-use gui --udid … --bundle-id … --ios <path> --port 44390 --daemon-port 44321 --no-open`,
+or the page's settings.
+
+### Or: the PowerShell script
+
+In PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\iphone-use.ps1
